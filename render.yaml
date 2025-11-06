@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: irsafam-discord-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m app
+    healthCheckPath: /health
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: DISCORD_CHANNEL_ID
+        sync: false
+      - key: TIMETABLE_URL
+        value: https://irsafam.org/ielts/timetable
+      - key: POLL_INTERVAL_MINUTES
+        value: "5"
+      - key: STATE_FILE
+        value: state.json
