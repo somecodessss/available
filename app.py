@@ -4,6 +4,7 @@ import json
 import re
 import hashlib
 from datetime import datetime, timezone
+from typing import Optional, Dict, List
 
 import aiohttp
 import discord
@@ -13,36 +14,43 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI
 import uvicorn
 
+# ------------------- HTTP (Render health) -------------------
 api = FastAPI()
+
+@api.get("/")
+async def root():
+    return {"ok": True}
 
 @api.get("/health")
 async def health():
     return {"ok": True}
 
+# ------------------- Config -------------------
 TOKEN = os.environ["DISCORD_TOKEN"]
 CHANNEL_ID = int(os.environ["DISCORD_CHANNEL_ID"])
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
+
 URL_IRSAFAM = os.getenv("TIMETABLE_URL", "https://irsafam.org/ielts/timetable")
 URL_TEHRAN = os.getenv("TIMETABLE_URL_2", "https://ieltstehran.com/computer-delivered-ielts-exam/")
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", str(int(os.getenv("POLL_INTERVAL_MINUTES", "1")) * 60)))
 
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "45"))
+
+# ------------------- Discord -------------------
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents, allowed_mentions=discord.AllowedMentions(everyone=True))
 tree = bot.tree
 
-_http: aiohttp.ClientSession | None = None
-_last_snapshot: dict = {}
-_poll_lock = asyncio.Lock()
+# ------------------- HTTP session -------------------
+_http: Optional[aiohttp.ClientSession] = None
 
-STATUS_FULL_PATTERNS = ("ظرفیت: تکمیل", "ظرفیت تکمیل", "تکمیل ظرفیت", "full", "closed", "no seats", "sold out")
-STATUS_OPEN_PATTERNS = ("ظرفیت: موجود", "ظرفیت موجود", "available", "open", "ثبت نام", "ثبت‌نام", "رزرو", "reserve", "book")
-STATUS_CANCELED_PATTERNS = ("لغو", "cancelled", "canceled")
+async def ensure_http() -> aiohttp.ClientSession:
+    global _http
+    if _http is None or _http.closed:
+        _http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25, connect=10))
+    return _http
 
-DATE_RE_ASC = re.compile(r"\b(?:\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}[/.-]\d{1,2}[/.-]\d{1,2})\b")
-DATE_RE_FA = re.compile(r"[۰-۹]{1,2}[/\.-][۰-۹]{1,2}[/\.-][۰-۹]{2,4}|[۰-۹]{4}[/\.-][۰-۹]{1,2}[/\.-][۰-۹]{1,2}")
-TIME_RE = re.compile(r"(?:ساعت\s*)?(\d{1,2}:\d{2}|\d{1,2}\s*(?:am|pm|AM|PM))\b")
-
+# ------------------- Text utils -------------------
 def _ws(t: str) -> str:
     return re.sub(r"\s+", " ", t.strip())
 
@@ -54,10 +62,19 @@ def _clean(t: str) -> str:
     t = t.replace("٫", ":").replace("ː", ":").replace("،", ",")
     return _ws(t)
 
+# ------------------- Patterns -------------------
+STATUS_FULL_PATTERNS = ("ظرفیت: تکمیل", "ظرفیت تکمیل", "تکمیل ظرفیت", "full", "closed", "sold out", "no seats")
+STATUS_OPEN_PATTERNS = ("ظرفیت: موجود", "ظرفیت موجود", "available", "open", "ثبت نام", "ثبت‌نام", "رزرو", "reserve", "book")
+STATUS_CANCELED_PATTERNS = ("لغو", "cancelled", "canceled")
+
+DATE_RE_ASC = re.compile(r"\b(?:\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}[/.-]\d{1,2}[/.-]\d{1,2})\b")
+DATE_RE_FA  = re.compile(r"[۰-۹]{1,2}[/\.-][۰-۹]{1,2}[/\.-][۰-۹]{2,4}|[۰-۹]{4}[/\.-][۰-۹]{1,2}[/\.-][۰-۹]{1,2}")
+TIME_RE     = re.compile(r"(?:ساعت\s*)?(\d{1,2}:\d{2}|\d{1,2}\s*(?:am|pm|AM|PM))\b", re.I)
+
 def _status(win: str) -> str:
     w = _clean(win).lower()
-    full_hit = any(p.lower() in w for p in STATUS_FULL_PATTERNS)
-    open_hit = any(p.lower() in w for p in STATUS_OPEN_PATTERNS)
+    full_hit   = any(p.lower() in w for p in STATUS_FULL_PATTERNS)
+    open_hit   = any(p.lower() in w for p in STATUS_OPEN_PATTERNS)
     cancel_hit = any(p.lower() in w for p in STATUS_CANCELED_PATTERNS)
     if full_hit and open_hit:
         return "full"
@@ -79,29 +96,41 @@ def _kind(block: str) -> str:
         return "IELTS"
     return "-"
 
+# ------------------- Fetch -------------------
 async def _fetch(url: str) -> str:
-    assert _http is not None
-    q = "&" if "?" in url else "?"
-    bust = f"{q}t={int(datetime.now().timestamp())}"
-    hdrs = {"Cache-Control": "no-cache", "Pragma": "no-cache", "User-Agent": "ielts-availability-bot/1.2", "Accept-Language": "fa,en;q=0.8"}
-    async with _http.get(url + bust, headers=hdrs, timeout=aiohttp.ClientTimeout(total=25, connect=10)) as r:
-        return await r.text()
+    s = await ensure_http()
+    bust = ("&" if "?" in url else "?") + f"t={int(datetime.now().timestamp())}"
+    hdrs = {
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "User-Agent": "ielts-availability-bot/1.3",
+        "Accept-Language": "fa,en;q=0.8",
+    }
+    for _ in range(3):
+        try:
+            async with s.get(url + bust, headers=hdrs) as r:
+                if r.status == 200:
+                    return await r.text()
+        except Exception:
+            await asyncio.sleep(0.6)
+    return ""
 
-def _entries_from_text(text: str, source: str) -> dict:
-    dates = []
+# ------------------- Parse -------------------
+def _entries_from_text(text: str, source: str) -> Dict[str, dict]:
+    dates: List[tuple] = []
     for m in DATE_RE_ASC.finditer(text):
         dates.append((m.group(), m.start(), m.end()))
     for m in DATE_RE_FA.finditer(text):
         dates.append((_fa2en(m.group()), m.start(), m.end()))
-    ent = {}
+    ent: Dict[str, dict] = {}
     if dates:
         for d, s, e in dates:
-            start = max(0, s - 180)
-            end = min(len(text), e + 180)
+            start = max(0, s - 160)
+            end   = min(len(text), e + 160)
             win = text[start:end]
-            st = _status(win)
-            kd = _kind(win)
-            tm = TIME_RE.search(win)
+            st  = _status(win)
+            kd  = _kind(win)
+            tm  = TIME_RE.search(win)
             tstr = tm.group(1) if tm else "-"
             key = " | ".join(x for x in [source, d, tstr, kd] if x)
             ent[key] = {"status": st, "source": source, "date": d, "time": tstr, "kind": kd, "context": win[:300]}
@@ -111,23 +140,25 @@ def _entries_from_text(text: str, source: str) -> dict:
         ent[key] = {"status": _status(text), "source": source, "date": "-", "time": "-", "kind": "-", "context": text[:300]}
     return ent
 
-def _parse_irsafam(html: str) -> dict:
+def parse_irsafam(html: str) -> Dict[str, dict]:
     soup = BeautifulSoup(html, "lxml")
     text = _clean(soup.get_text(separator=" "))
     return _entries_from_text(text, "Irsafam")
 
-def _parse_ieltstehran(html: str) -> dict:
+def parse_ieltstehran(html: str) -> Dict[str, dict]:
     soup = BeautifulSoup(html, "lxml")
     text = _clean(soup.get_text(separator=" "))
-    ent = {}
-    for m in re.finditer(r"ظرفیت\s*[:：]\s*([^\s،,]+)", text):
+    ent: Dict[str, dict] = {}
+
+    for m in re.finditer(r"ظرفیت\s*[:：]?\s*([^\s،,]+)", text):
         cap = m.group(1)
-        start = max(0, m.start() - 160)
-        end = min(len(text), m.end() + 160)
+        start = max(0, m.start() - 140)
+        end   = min(len(text), m.end() + 140)
         win = text[start:end]
-        kd = _kind(win) or "CDIELTS"
-        tm = TIME_RE.search(win)
+        kd  = _kind(win) or "CDIELTS"
+        tm  = TIME_RE.search(win)
         tstr = tm.group(1) if tm else "-"
+
         date_val = "-"
         best = None
         for dm in DATE_RE_ASC.finditer(win):
@@ -141,6 +172,7 @@ def _parse_ieltstehran(html: str) -> dict:
                     best = (dist, _fa2en(dm.group()))
         if best is not None:
             date_val = best[1]
+
         cap_l = cap.lower()
         if ("تکمیل" in cap_l) or ("full" in cap_l):
             st = "full"
@@ -148,22 +180,25 @@ def _parse_ieltstehran(html: str) -> dict:
             st = "open"
         else:
             st = _status(win)
-            if st == "open" and ("تکمیل" in win or "ظرفیت تکمیل" in win or "تکمیل ظرفیت" in win or "full" in win or "closed" in win):
+            if st == "open" and any(tok in win for tok in ("ظرفیت: تکمیل", "ظرفیت تکمیل", "تکمیل ظرفیت", "full", "closed")):
                 st = "full"
+
         key = " | ".join(x for x in ["IELTS Tehran", date_val, tstr, kd] if x)
         ent[key] = {"status": st, "source": "IELTS Tehran", "date": date_val, "time": tstr, "kind": kd, "context": win[:300]}
+
     if ent:
         return ent
     return _entries_from_text(text, "IELTS Tehran")
 
-async def scrape() -> dict:
+async def scrape_both() -> Dict[str, dict]:
     h1, h2 = await asyncio.gather(_fetch(URL_IRSAFAM), _fetch(URL_TEHRAN))
-    e1 = _parse_irsafam(h1)
-    e2 = _parse_ieltstehran(h2)
-    m = {**e1, **e2}
-    return m
+    e1 = parse_irsafam(h1 or "")
+    e2 = parse_ieltstehran(h2 or "")
+    merged = {**e1, **e2}
+    return merged
 
-def _load_state() -> dict:
+# ------------------- State & Diff -------------------
+def load_state() -> dict:
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -172,58 +207,59 @@ def _load_state() -> dict:
             return {"entries": {}}
     return {"entries": {}}
 
-def _save_state(obj: dict) -> None:
+def save_state(obj: dict) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
-def _diff(prev: dict, curr: dict) -> list:
-    changes = []
+def diff(prev: dict, curr: dict) -> List[dict]:
     p = prev.get("entries", {}) if "entries" in prev else prev
     c = curr.get("entries", {}) if "entries" in curr else curr
     keys = set(p.keys()) | set(c.keys())
-    for k in sorted(keys):
+    out: List[dict] = []
+    for k in keys:
         pv = p.get(k)
         cv = c.get(k)
         if pv is None:
-            changes.append({"key": k, "type": "added", "from": None, "to": cv["status"], "entry": cv})
+            out.append({"key": k, "type": "added", "from": None, "to": cv["status"], "entry": cv})
         elif cv is None:
-            changes.append({"key": k, "type": "removed", "from": pv["status"], "to": None, "entry": pv})
+            out.append({"key": k, "type": "removed", "from": pv["status"], "to": None, "entry": pv})
         elif pv["status"] != cv["status"]:
-            changes.append({"key": k, "type": "changed", "from": pv["status"], "to": cv["status"], "entry": cv})
-    return changes
+            out.append({"key": k, "type": "changed", "from": pv["status"], "to": cv["status"], "entry": cv})
+    return out
 
-def _field_txt(lines: list[str]) -> str:
+# ------------------- Embeds + UI -------------------
+def _field_text(lines: List[str]) -> str:
     if not lines:
         return "—"
     s = "\n".join(lines)
     return s[:1024] if len(s) > 1024 else s
 
-class Links(discord.ui.View):
+class SourceLinks(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(discord.ui.Button(label="Irsafam", url=URL_IRSAFAM))
         self.add_item(discord.ui.Button(label="IELTS Tehran", url=URL_TEHRAN))
 
-def embed_timetable(entries: dict) -> discord.Embed:
+def embed_timetable(entries: Dict[str, dict]) -> discord.Embed:
     now = datetime.now(timezone.utc)
-    e = discord.Embed(title="AAA — IELTS Schedules", timestamp=now, color=0x2B2D31)
+    e = discord.Embed(title="IELTS — Times & Availability", timestamp=now, color=0x2B2D31)
     groups = {"Irsafam": {"open": [], "full": []}, "IELTS Tehran": {"open": [], "full": []}}
     for v in entries.values():
         src = v.get("source", "Irsafam")
-        st = v.get("status", "unknown")
+        st  = v.get("status", "unknown")
         row = f"{v.get('date','-')} • {v.get('time','-')} • {v.get('kind','-')}"
         if st == "open":
             groups.setdefault(src, {"open": [], "full": []})["open"].append(f"🟢 {row}")
         elif st == "full":
             groups.setdefault(src, {"open": [], "full": []})["full"].append(f"🔴 {row}")
     for src in ("Irsafam", "IELTS Tehran"):
-        e.add_field(name=f"{src} — Open", value=_field_txt(groups[src]["open"][:20]), inline=False)
-        e.add_field(name=f"{src} — Full", value=_field_txt(groups[src]["full"][:20]), inline=False)
-    e.add_field(name="Links", value=f"[Irsafam]({URL_IRSAFAM}) • [IELTS Tehran]({URL_TEHRAN})", inline=False)
-    e.set_footer(text="Ephemeral")
+        e.add_field(name=f"{src} — Open", value=_field_text(groups[src]["open"][:20]), inline=False)
+        e.add_field(name=f"{src} — Full", value=_field_text(groups[src]["full"][:20]), inline=False)
+    e.add_field(name="Sources", value=f"[Irsafam]({URL_IRSAFAM}) • [IELTS Tehran]({URL_TEHRAN})", inline=False)
+    e.set_footer(text="Ephemeral snapshot")
     return e
 
-def embed_alert(open_changes: list) -> discord.Embed:
+def embed_alert(open_changes: List[dict]) -> discord.Embed:
     now = datetime.now(timezone.utc)
     e = discord.Embed(title="Seats Available — Alert", timestamp=now, color=0x57F287)
     lines = []
@@ -234,30 +270,33 @@ def embed_alert(open_changes: list) -> discord.Embed:
     e.add_field(name="Links", value=f"[Irsafam]({URL_IRSAFAM}) • [IELTS Tehran]({URL_TEHRAN})", inline=False)
     return e
 
-def embed_panel(entries: dict, last_run: datetime | None) -> discord.Embed:
+def embed_panel(entries: Dict[str, dict]) -> discord.Embed:
     now = datetime.now(timezone.utc)
     total_open = sum(1 for v in entries.values() if v.get("status") == "open")
     total_full = sum(1 for v in entries.values() if v.get("status") == "full")
-    e = discord.Embed(title="AAA — IELTS Bot Panel", timestamp=now, color=0x5865F2)
-    e.add_field(name="Counts", value=f"🟢 Open: **{total_open}**\n🔴 Full: **{total_full}**", inline=True)
-    e.add_field(name="Commands", value="`/ielts timetable` • `/ielts panel` • `/ielts refresh`", inline=True)
-    if last_run:
-        e.add_field(name="Last Check", value=f"{last_run.isoformat()}Z", inline=False)
-    e.add_field(name="Links", value=f"[Irsafam]({URL_IRSAFAM}) • [IELTS Tehran]({URL_TEHRAN})", inline=False)
+    e = discord.Embed(title="IELTS Bot — Panel", timestamp=now, color=0x5865F2)
+    e.add_field(name="Open", value=f"🟢 **{total_open}**", inline=True)
+    e.add_field(name="Full", value=f"🔴 **{total_full}**", inline=True)
+    e.add_field(name="Slash Commands", value="`/ielts timetable` • `/ielts panel` • `/ielts refresh`", inline=False)
+    e.add_field(name="Auto Announcements", value="Tags **@everyone** when seats open.", inline=False)
     return e
+
+# ------------------- Polling -------------------
+_last_snapshot: Dict[str, dict] = {}
+_poll_lock = asyncio.Lock()
 
 @tasks.loop(seconds=POLL_INTERVAL_SECONDS)
 async def poll():
     async with _poll_lock:
         try:
-            current = await scrape()
+            current = await scrape_both()
         except Exception:
             return
-        prev_state = _load_state()
-        prev = prev_state.get("entries", {})
-        changes = _diff({"entries": prev}, {"entries": current})
+        state = load_state()
+        prev = state.get("entries", {})
+        changes = diff({"entries": prev}, {"entries": current})
         if changes:
-            _save_state({"entries": current})
+            save_state({"entries": current})
             open_changes = [c for c in changes if c["to"] == "open"]
             if open_changes:
                 ch = bot.get_channel(CHANNEL_ID)
@@ -267,50 +306,71 @@ async def poll():
                     except Exception:
                         ch = None
                 if ch:
-                    await ch.send(content="@everyone", embed=embed_alert(open_changes), allowed_mentions=discord.AllowedMentions(everyone=True), view=Links())
+                    await ch.send(content="@everyone", embed=embed_alert(open_changes), allowed_mentions=discord.AllowedMentions(everyone=True), view=SourceLinks())
         global _last_snapshot
         _last_snapshot = current
 
-ielts = app_commands.Group(name="ielts", description="IELTS tools")
+# ------------------- Commands -------------------
+ielts = app_commands.Group(name="ielts", description="IELTS availability tools")
 
-@ielts.command(name="timetable", description="Times and availability from Irsafam + IELTS Tehran")
+@ielts.command(name="timetable", description="Show times and availability (Irsafam + IELTS Tehran)")
 async def cmd_timetable(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    async with _poll_lock:
-        try:
-            data = await scrape()
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        return
+    try:
+        async with _poll_lock:
+            data = await scrape_both()
             global _last_snapshot
             _last_snapshot = data
-            await interaction.followup.send(embed=embed_timetable(data), ephemeral=True, view=Links())
+        await interaction.followup.send(embed=embed_timetable(data), ephemeral=True, view=SourceLinks())
+    except Exception:
+        try:
+            await interaction.followup.send("Failed to fetch timetables.", ephemeral=True)
         except Exception:
-            await interaction.followup.send("Fetch failed.", ephemeral=True)
+            pass
 
 @ielts.command(name="panel", description="Dashboard and quick links")
 async def cmd_panel(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    data = _last_snapshot or _load_state().get("entries", {})
-    await interaction.followup.send(embed=embed_panel(data, datetime.now(timezone.utc)), ephemeral=True, view=Links())
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        return
+    try:
+        data = _last_snapshot or load_state().get("entries", {})
+        await interaction.followup.send(embed=embed_panel(data), ephemeral=True, view=SourceLinks())
+    except Exception:
+        try:
+            await interaction.followup.send("Failed.", ephemeral=True)
+        except Exception:
+            pass
 
 @ielts.command(name="refresh", description="Force an immediate scrape")
 async def cmd_refresh(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    async with _poll_lock:
-        try:
-            data = await scrape()
-            _save_state({"entries": data})
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        return
+    try:
+        async with _poll_lock:
+            data = await scrape_both()
+            save_state({"entries": data})
             global _last_snapshot
             _last_snapshot = data
-            await interaction.followup.send("Refreshed.", ephemeral=True)
-        except Exception:
+        await interaction.followup.send("Refreshed.", ephemeral=True)
+    except Exception:
+        try:
             await interaction.followup.send("Refresh failed.", ephemeral=True)
+        except Exception:
+            pass
 
 tree.add_command(ielts)
 
+# ------------------- Lifecycle -------------------
 @bot.event
 async def on_ready():
-    global _http
-    if _http is None or _http.closed:
-        _http = aiohttp.ClientSession()
+    await ensure_http()
     if not poll.is_running():
         poll.start()
     try:
@@ -321,6 +381,7 @@ async def on_ready():
     except Exception:
         pass
 
+# ------------------- Run -------------------
 async def _run_http():
     port = int(os.environ.get("PORT", "8000"))
     cfg = uvicorn.Config(api, host="0.0.0.0", port=port, log_level="info")
@@ -334,14 +395,13 @@ async def _keep_render_awake():
     if not url.endswith("/"):
         url = url + "/"
     endpoint = url + "health"
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as s:
-        while True:
-            try:
-                await s.get(endpoint)
-            except Exception:
-                pass
-            await asyncio.sleep(240)
+    s = await ensure_http()
+    while True:
+        try:
+            await s.get(endpoint)
+        except Exception:
+            pass
+        await asyncio.sleep(240)
 
 async def main():
     await asyncio.gather(_run_http(), _keep_render_awake(), bot.start(TOKEN))
