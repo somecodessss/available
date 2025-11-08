@@ -160,10 +160,11 @@ def parse_ieltstehran(html: str) -> Dict[str, dict]:
         cap_l = cap.lower()
         if ("تکمیل" in cap_l) or ("full" in cap_l):
             st = "full"
-        elif ("موجود" in cap_l) or ("available" in cap_l) or ("open" in cap_l):
+        elif any(tok in cap_l for tok in ("موجود", "باز", "خالی")):
             st = "open"
         else:
             st = "unknown"
+
         key = " | ".join(x for x in ["IELTS Tehran", date_val, tstr, kd] if x)
         ent[key] = {"status": st, "source": "IELTS Tehran", "date": date_val, "time": tstr, "kind": kd, "context": win[:300]}
     if ent:
@@ -287,13 +288,13 @@ ielts = app_commands.Group(name="ielts", description="IELTS availability tools")
 
 @ielts.command(name="timetable", description="Show times and availability")
 async def cmd_timetable(interaction: discord.Interaction):
+    global _last_snapshot
     data = _last_snapshot or load_state().get("entries", {})
     msg_embed = embed_timetable(data)
     await interaction.response.send_message(embed=msg_embed, ephemeral=True, view=SourceLinks())
     try:
         async with _poll_lock:
             fresh = await asyncio.wait_for(scrape_both(), timeout=8)
-            global _last_snapshot
             _last_snapshot = fresh
         await interaction.edit_original_response(embed=embed_timetable(fresh), view=SourceLinks())
     except Exception:
@@ -306,16 +307,17 @@ async def cmd_panel(interaction: discord.Interaction):
 
 @ielts.command(name="refresh", description="Force an immediate scrape")
 async def cmd_refresh(interaction: discord.Interaction):
+    global _last_snapshot
     await interaction.response.send_message("Refreshing…", ephemeral=True)
     try:
         async with _poll_lock:
             data = await scrape_both()
             save_state({"entries": data})
-            global _last_snapshot
             _last_snapshot = data
         await interaction.edit_original_response(content="Refreshed.")
     except Exception:
         await interaction.edit_original_response(content="Refresh failed.")
+
 
 tree.add_command(ielts)
 
