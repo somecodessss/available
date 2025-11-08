@@ -46,23 +46,15 @@ _last_snapshot: Dict[str, dict] = {}
 _panel_message_id: Optional[int] = None
 _poll_lock = asyncio.Lock()
 
-STATUS_FULL_TOKENS = (
-    "ظرفیت: تکمیل", "ظرفیت تکمیل", "تکمیل ظرفیت", "تکمیل", "پر", "ناموجود",
-    "full", "closed", "sold out", "no seats", "not available"
-)
-STATUS_OPEN_TOKENS = (
-    "ظرفیت: موجود", "ظرفیت موجود", "خالی", "باز", "در دسترس", "قابل رزرو",
-    "ثبت نام", "رزرو", "available", "open", "book now", "register"
-)
-
 MONTHS = r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
 DATE_RE_ASC = re.compile(r"\b(?:\d{1,2}[/\.-]\d{1,2}[/\.-]\d{2,4}|\d{4}[/\.-]\d{1,2}[/\.-]\d{1,2})\b", re.I)
 DATE_RE_MON1 = re.compile(rf"\b(?:\d{{1,2}}\s+(?:{MONTHS})\s+\d{{4}})\b", re.I)
 DATE_RE_MON2 = re.compile(rf"\b(?:(?:{MONTHS})\s+\d{{1,2}},?\s+\d{{4}})\b", re.I)
 DATE_RE_FA  = re.compile(r"[۰-۹]{1,2}[/\.-][۰-۹]{1,2}[/\.-][۰-۹]{2,4}|[۰-۹]{4}[/\.-][۰-۹]{1,2}[/\.-][۰-۹]{1,2}")
 TIME_RE     = re.compile(r"(?:ساعت\s*)?(\d{1,2}[:٫]\d{2}|\d{1,2}\s*(?:am|pm|AM|PM))\b", re.I)
-FULL_RE     = re.compile(r"(تکمیل(?:\s*ظرفیت)?|ظرفیت\s*تکمیل|ناموجود|full|closed|sold out|no seats)", re.I)
-OPEN_RE     = re.compile(r"(ظرفیت\s*(?:موجود|باز|خالی)|در\s*دسترس|قابل\s*رزرو|ثبت\s*نام|رزرو|available|open|book\s*now|register)", re.I)
+
+IRSAFAM_FULL = re.compile(r"\bتکمیل\s*ظرفیت\b")
+TEHRAN_FULL  = re.compile(r"\bظرفیت\s*[:：]\s*تکمیل\b")
 
 def _ws(t: str) -> str:
     return re.sub(r"\s+", " ", t.strip())
@@ -85,10 +77,23 @@ def _kind(block: str) -> str:
         return "IELTS"
     return "-"
 
+def _pick_date(node_text: str) -> str:
+    t = _clean(node_text)
+    for rx in (DATE_RE_ASC, DATE_RE_MON1, DATE_RE_MON2, DATE_RE_FA):
+        m = rx.search(t)
+        if m:
+            return _fa2en(m.group(0))
+    return "-"
+
+def _pick_time(node_text: str) -> str:
+    t = _clean(node_text)
+    m = TIME_RE.search(t)
+    return _fa2en(m.group(1)) if m else "-"
+
 async def ensure_http() -> aiohttp.ClientSession:
     global _http
     if _http is None or _http.closed:
-        connector = aiohttp.TCPConnector(limit=6, ttl_dns_cache=600, ssl=False, keepalive_timeout=45)
+        connector = aiohttp.TCPConnector(limit=8, ttl_dns_cache=600, ssl=False, keepalive_timeout=45)
         timeout = aiohttp.ClientTimeout(total=45, connect=15, sock_read=30, sock_connect=15)
         _http = aiohttp.ClientSession(connector=connector, timeout=timeout, trust_env=True)
     return _http
@@ -120,95 +125,47 @@ async def _fetch(url: str) -> str:
             delay = min(4.0, delay * 1.5)
     return ""
 
-def _pick_date_from_node(node_text: str) -> str:
-    t = _clean(node_text)
+def _collect_by_dates(text: str) -> List[tuple]:
+    t = _clean(text)
+    hits = []
     for rx in (DATE_RE_ASC, DATE_RE_MON1, DATE_RE_MON2, DATE_RE_FA):
-        m = rx.search(t)
-        if m:
-            g = m.group(0)
-            return _fa2en(g)
-    return "-"
+        for m in rx.finditer(t):
+            hits.append((m.group(0), m.start(), m.end()))
+    hits.sort(key=lambda x: x[1])
+    return hits
 
-def _pick_time_from_node(node_text: str) -> str:
-    t = _clean(node_text)
-    m = TIME_RE.search(t)
-    return _fa2en(m.group(1)) if m else "-"
-
-def _scan_blocks_for_status(soup: BeautifulSoup, source: str) -> Dict[str, dict]:
-    ent: Dict[str, dict] = {}
-    def capture(block_text: str, status: str):
-        kd = _kind(block_text)
-        dstr = _pick_date_from_node(block_text)
-        tstr = _pick_time_from_node(block_text)
-        key = " | ".join(x for x in [source, dstr, tstr, kd] if x)
-        ent[key] = {"status": status, "source": source, "date": dstr, "time": tstr, "kind": kd, "context": _clean(block_text)[:300]}
-    for tag in soup.find_all(text=FULL_RE):
-        blk = tag
-        for _ in range(6):
-            if getattr(blk, "parent", None) is None:
-                break
-            blk = blk.parent
-            txt = blk.get_text(separator=" ", strip=True)
-            if len(txt) > 40:
-                capture(txt, "full")
-                break
-    for tag in soup.find_all(text=OPEN_RE):
-        blk = tag
-        for _ in range(6):
-            if getattr(blk, "parent", None) is None:
-                break
-            blk = blk.parent
-            txt = blk.get_text(separator=" ", strip=True)
-            if len(txt) > 40:
-                capture(txt, "open")
-                break
-    return ent
+def _entries_from_page(text: str, source: str, full_marker: re.Pattern) -> Dict[str, dict]:
+    t = _clean(text)
+    entries: Dict[str, dict] = {}
+    dates = _collect_by_dates(t)
+    if not dates:
+        snippet = " ".join(t.split()[:80])
+        if snippet:
+            h = hashlib.sha256(snippet.encode("utf-8")).hexdigest()[:16]
+            key = f"{source} | {h}"
+            status = "full" if full_marker.search(t) else "open"
+            entries[key] = {"status": status, "source": source, "date": "-", "time": "-", "kind": "-", "context": snippet[:300]}
+        return entries
+    for d, s, e in dates:
+        start = max(0, s - 220)
+        end = min(len(t), e + 220)
+        win = t[start:end]
+        status = "full" if full_marker.search(win) else "open"
+        kd = _kind(win)
+        tm = _pick_time(win)
+        key = " | ".join(x for x in [source, d, tm, kd] if x)
+        entries[key] = {"status": status, "source": source, "date": _fa2en(d), "time": tm, "kind": kd, "context": win[:300]}
+    return entries
 
 def parse_irsafam(html: str) -> Dict[str, dict]:
     soup = BeautifulSoup(html, "lxml")
-    ent = _scan_blocks_for_status(soup, "Irsafam")
-    if ent:
-        return ent
     text = soup.get_text(separator=" ")
-    return _entries_from_text(text, "Irsafam")
+    return _entries_from_page(text, "Irsafam", IRSAFAM_FULL)
 
 def parse_ieltstehran(html: str) -> Dict[str, dict]:
     soup = BeautifulSoup(html, "lxml")
-    ent = _scan_blocks_for_status(soup, "IELTS Tehran")
-    if ent:
-        return ent
     text = soup.get_text(separator=" ")
-    return _entries_from_text(text, "IELTS Tehran")
-
-def _entries_from_text(text: str, source: str) -> Dict[str, dict]:
-    t = _clean(text)
-    ent: Dict[str, dict] = {}
-    for m in FULL_RE.finditer(t):
-        start = max(0, m.start() - 220)
-        end = min(len(t), m.end() + 220)
-        win = t[start:end]
-        kd = _kind(win)
-        dstr = _pick_date_from_node(win)
-        tstr = _pick_time_from_node(win)
-        key = " | ".join(x for x in [source, dstr, tstr, kd] if x)
-        ent[key] = {"status": "full", "source": source, "date": dstr, "time": tstr, "kind": kd, "context": win[:300]}
-    for m in OPEN_RE.finditer(t):
-        start = max(0, m.start() - 220)
-        end = min(len(t), m.end() + 220)
-        win = t[start:end]
-        kd = _kind(win)
-        dstr = _pick_date_from_node(win)
-        tstr = _pick_time_from_node(win)
-        key = " | ".join(x for x in [source, dstr, tstr, kd] if x)
-        ent[key] = {"status": "open", "source": source, "date": dstr, "time": tstr, "kind": kd, "context": win[:300]}
-    if ent:
-        return ent
-    snippet = " ".join(t.split()[:80])
-    if snippet:
-        h = hashlib.sha256(snippet.encode("utf-8")).hexdigest()[:16]
-        key = f"{source} | {h}"
-        ent[key] = {"status": "full", "source": source, "date": "-", "time": "-", "kind": "-", "context": snippet[:300]}
-    return ent
+    return _entries_from_page(text, "IELTS Tehran", TEHRAN_FULL)
 
 async def scrape_both() -> Dict[str, dict]:
     h1, h2 = await asyncio.gather(_fetch(URL_IRSAFAM), _fetch(URL_TEHRAN))
@@ -355,7 +312,7 @@ async def poll():
         changes = diff({"entries": prev}, {"entries": current})
         if changes:
             save_state({"entries": current, "panel_message_id": state.get("panel_message_id")})
-            open_changes = [c for c in changes if c["to"] == "open"]
+            open_changes = [c for c in changes if c["from"] == "full" and c["to"] != "full"]
             if open_changes:
                 ch = bot.get_channel(CHANNEL_ID)
                 if ch is None:
