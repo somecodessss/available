@@ -254,6 +254,32 @@ def embed_panel(entries: Dict[str, dict]) -> discord.Embed:
     e.add_field(name="Auto Announcements", value="Tags @everyone when seats open.", inline=False)
     return e
 
+def _ephemeral_for(interaction: discord.Interaction) -> bool:
+    return interaction.guild_id is not None
+
+async def _ensure_initial_response(interaction: discord.Interaction, ephemeral: bool) -> None:
+    if interaction.response.is_done():
+        return
+    try:
+        await interaction.response.defer(ephemeral=ephemeral, thinking=True)
+    except Exception:
+        try:
+            await interaction.response.send_message("\u200b", ephemeral=ephemeral)
+        except Exception:
+            pass
+
+async def _safe_edit_original(interaction: discord.Interaction, *, content: Optional[str] = None, embed: Optional[discord.Embed] = None, view: Optional[discord.ui.View] = None, ephemeral: bool) -> None:
+    try:
+        await interaction.edit_original_response(content=content, embed=embed, view=view)
+    except Exception:
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(content=content, embed=embed, view=view, ephemeral=ephemeral)
+            else:
+                await interaction.response.send_message(content=content, embed=embed, view=view, ephemeral=ephemeral)
+        except Exception:
+            pass
+
 @tasks.loop(seconds=POLL_INTERVAL_SECONDS)
 async def poll():
     async with _poll_lock:
@@ -283,45 +309,43 @@ ielts = app_commands.Group(name="ielts", description="IELTS availability tools")
 
 async def _refresh_and_edit(interaction: discord.Interaction):
     global _last_snapshot
+    ephemeral = _ephemeral_for(interaction)
     try:
         async with _poll_lock:
             fresh = await asyncio.wait_for(scrape_both(), timeout=8)
             _last_snapshot = fresh
-        try:
-            await interaction.edit_original_response(embed=embed_timetable(fresh), view=SourceLinks())
-        except Exception:
-            pass
+        await _safe_edit_original(interaction, embed=embed_timetable(fresh), view=SourceLinks(), ephemeral=ephemeral)
     except Exception:
         pass
 
 @ielts.command(name="timetable", description="Show times and availability")
 async def cmd_timetable(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    ephemeral = _ephemeral_for(interaction)
+    await _ensure_initial_response(interaction, ephemeral)
     data = _last_snapshot or load_state().get("entries", {})
-    try:
-        await interaction.edit_original_response(embed=embed_timetable(data), view=SourceLinks())
-    except Exception:
-        return
+    await _safe_edit_original(interaction, embed=embed_timetable(data), view=SourceLinks(), ephemeral=ephemeral)
     asyncio.create_task(_refresh_and_edit(interaction))
 
 @ielts.command(name="panel", description="Dashboard and quick links")
 async def cmd_panel(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    ephemeral = _ephemeral_for(interaction)
+    await _ensure_initial_response(interaction, ephemeral)
     data = _last_snapshot or load_state().get("entries", {})
-    await interaction.edit_original_response(embed=embed_panel(data), view=SourceLinks())
+    await _safe_edit_original(interaction, embed=embed_panel(data), view=SourceLinks(), ephemeral=ephemeral)
 
 @ielts.command(name="refresh", description="Force an immediate scrape")
 async def cmd_refresh(interaction: discord.Interaction):
     global _last_snapshot
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    ephemeral = _ephemeral_for(interaction)
+    await _ensure_initial_response(interaction, ephemeral)
     try:
         async with _poll_lock:
             data = await asyncio.wait_for(scrape_both(), timeout=10)
             save_state({"entries": data})
             _last_snapshot = data
-        await interaction.edit_original_response(content="Refreshed.")
+        await _safe_edit_original(interaction, content="Refreshed.", embed=None, view=None, ephemeral=ephemeral)
     except Exception:
-        await interaction.edit_original_response(content="Refresh failed.")
+        await _safe_edit_original(interaction, content="Refresh failed.", embed=None, view=None, ephemeral=ephemeral)
 
 tree.add_command(ielts)
 
@@ -334,9 +358,11 @@ async def on_ready():
         if GUILD_ID > 0:
             await tree.sync(guild=discord.Object(id=GUILD_ID))
         else:
+            for g in bot.guilds:
+                await tree.sync(guild=g)
             await tree.sync()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Sync error: {e}")
 
 async def _run_http():
     port = int(os.environ.get("PORT", "8000"))
