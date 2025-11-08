@@ -56,21 +56,24 @@ STATUS_OPEN_TOKENS = (
 )
 STATUS_CANCEL_TOKENS = ("لغو", "cancelled", "canceled")
 
-DATE_RE_ASC = re.compile(r"\b(?:\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}[/.-]\d{1,2}[/.-]\d{1,2})\b")
+MONTHS = r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
+DATE_RE_ASC = re.compile(r"\b(?:\d{1,2}[/\.-]\d{1,2}[/\.-]\d{2,4}|\d{4}[/\.-]\d{1,2}[/\.-]\d{1,2})\b")
+DATE_RE_MON1 = re.compile(rf"\b(?:\d{{1,2}}\s+(?:{MONTHS})\s+\d{{4}})\b", re.I)
+DATE_RE_MON2 = re.compile(rf"\b(?:(?:{MONTHS})\s+\d{{1,2}},?\s+\d{{4}})\b", re.I)
 DATE_RE_FA  = re.compile(r"[۰-۹]{1,2}[/\.-][۰-۹]{1,2}[/\.-][۰-۹]{2,4}|[۰-۹]{4}[/\.-][۰-۹]{1,2}[/\.-][۰-۹]{1,2}")
-TIME_RE     = re.compile(r"(?:ساعت\s*)?(\d{1,2}:\d{2}|\d{1,2}\s*(?:am|pm|AM|PM))\b", re.I)
-CAP_RE      = re.compile(r"(?:ظرفیت|ظرفيت)\s*[:：]\s*([^\s،,]+)")
+TIME_RE     = re.compile(r"(?:ساعت\s*)?(\d{1,2}[:٫]\d{2}|\d{1,2}\s*(?:am|pm|AM|PM))\b", re.I)
+FULL_RE     = re.compile(r"(تکمیل(?:\s*ظرفیت)?|ظرفیت\s*تکمیل|ناموجود|full|closed|sold out|no seats)", re.I)
+OPEN_RE     = re.compile(r"(ظرفیت\s*(?:موجود|باز|خالی)|در\s*دسترس|قابل\s*رزرو|ثبت\s*نام|رزرو|available|open|book\s*now|register)", re.I)
 
 def _ws(t: str) -> str:
     return re.sub(r"\s+", " ", t.strip())
 
 def _fa2en(s: str) -> str:
-    return s.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789"))
+    return s.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")).replace("٫", ":")
 
 def _clean(t: str) -> str:
     t = _fa2en(t)
-    t = t.replace("\u200c", " ").replace("\u200f", " ").replace("\u202a", " ").replace("\u202b", " ")
-    t = t.replace("٫", ":").replace("ː", ":").replace("،", ",")
+    t = t.replace("\u200c", " ").replace("\u200f", " ").replace("\u202a", " ").replace("\u202b", " ").replace("،", ",")
     return _ws(t)
 
 def _status_generic(win: str) -> str:
@@ -85,9 +88,9 @@ def _status_generic(win: str) -> str:
 
 def _kind(block: str) -> str:
     b = block.upper()
-    if "UKVI" in b:
+    if "UKVI" in b or "CDUKVI" in b or "UKVI" in block:
         return "UKVI"
-    if "CDIELTS" in b or "COMPUTER-DELIVERED" in b or "COMPUTER DELIVERED" in b:
+    if "CDIELTS" in b or "COMPUTER-DELIVERED" in b or "COMPUTER DELIVERED" in b or "CD " in b or "CD-" in b:
         return "CDIELTS"
     if "IELTS" in b or "آیلتس" in block:
         return "IELTS"
@@ -97,7 +100,7 @@ async def ensure_http() -> aiohttp.ClientSession:
     global _http
     if _http is None or _http.closed:
         connector = aiohttp.TCPConnector(limit=6, ttl_dns_cache=600, ssl=False, keepalive_timeout=45)
-        timeout = aiohttp.ClientTimeout(total=40, connect=15, sock_read=25, sock_connect=15)
+        timeout = aiohttp.ClientTimeout(total=45, connect=15, sock_read=30, sock_connect=15)
         _http = aiohttp.ClientSession(connector=connector, timeout=timeout, trust_env=True)
     return _http
 
@@ -109,91 +112,101 @@ async def _fetch(url: str) -> str:
     hdrs = {
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
-        "User-Agent": "Mozilla/5.0 (compatible; IELTSBot/1.10; +https://example.invalid)",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
         "Accept-Language": "fa,en;q=0.8",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Referer": referer,
         "DNT": "1",
     }
-    delay = 0.8
+    delay = 0.7
     for _ in range(6):
         try:
             async with s.get(url + bust, headers=hdrs, allow_redirects=True) as r:
                 if r.status == 200:
                     text = await r.text(errors="ignore")
-                    if text:
+                    if text and len(text) > 500:
                         return text
         except Exception:
             await asyncio.sleep(delay)
-            delay = min(4.0, delay * 1.4)
+            delay = min(4.0, delay * 1.5)
     return ""
 
-def _entries_from_text(text: str, source: str) -> Dict[str, dict]:
-    text = _clean(text)
-    dates: List[tuple] = []
-    for m in DATE_RE_ASC.finditer(text):
-        dates.append((m.group(), m.start(), m.end()))
-    for m in DATE_RE_FA.finditer(text):
-        dates.append((_fa2en(m.group()), m.start(), m.end()))
+def _pick_date_near(text: str, anchor_start: int, start: int, end: int) -> str:
+    win = text[start:end]
+    best = None
+    for rx in (DATE_RE_ASC, DATE_RE_MON1, DATE_RE_MON2):
+        for dm in rx.finditer(win):
+            dist = abs((start + dm.start()) - anchor_start)
+            if best is None or dist < best[0]:
+                best = (dist, dm.group())
+    if best is None:
+        for dm in DATE_RE_FA.finditer(win):
+            dist = abs((start + dm.start()) - anchor_start)
+            if best is None or dist < best[0]:
+                best = (dist, _fa2en(dm.group()))
+    return best[1] if best else "-"
+
+def _entries_from_status_scans(text: str, source: str) -> Dict[str, dict]:
+    t = _clean(text)
     ent: Dict[str, dict] = {}
+    for rx, st in ((FULL_RE, "full"), (OPEN_RE, "open")):
+        for m in rx.finditer(t):
+            start = max(0, m.start() - 220)
+            end = min(len(t), m.end() + 220)
+            win = t[start:end]
+            kd = _kind(win)
+            tm = TIME_RE.search(win)
+            tstr = _fa2en(tm.group(1)) if tm else "-"
+            dstr = _pick_date_near(t, m.start(), start, end)
+            key = " | ".join(x for x in [source, dstr, tstr, kd] if x)
+            ent[key] = {"status": st, "source": source, "date": dstr, "time": tstr, "kind": kd, "context": win[:300]}
+    if ent:
+        return ent
+    return {}
+
+def _entries_from_text(text: str, source: str) -> Dict[str, dict]:
+    t = _clean(text)
+    ent = _entries_from_status_scans(t, source)
+    if ent:
+        return ent
+    dates: List[tuple] = []
+    for rx in (DATE_RE_ASC, DATE_RE_MON1, DATE_RE_MON2):
+        for m in rx.finditer(t):
+            dates.append((m.group(), m.start(), m.end()))
+    for m in DATE_RE_FA.finditer(t):
+        dates.append((_fa2en(m.group()), m.start(), m.end()))
+    out: Dict[str, dict] = {}
     if dates:
         for d, s, e in dates:
-            start = max(0, s - 160)
-            end   = min(len(text), e + 160)
-            win = text[start:end]
+            start = max(0, s - 180)
+            end   = min(len(t), e + 180)
+            win = t[start:end]
             st  = _status_generic(win)
             kd  = _kind(win)
             tm  = TIME_RE.search(win)
-            tstr = tm.group(1) if tm else "-"
+            tstr = _fa2en(tm.group(1)) if tm else "-"
             key = " | ".join(x for x in [source, d, tstr, kd] if x)
-            ent[key] = {"status": st, "source": source, "date": d, "time": tstr, "kind": kd, "context": win[:300]}
+            out[key] = {"status": st, "source": source, "date": d, "time": tstr, "kind": kd, "context": win[:300]}
     else:
-        core = " ".join(text.split()[:40])
-        if core:
-            h = hashlib.sha256(core.encode("utf-8")).hexdigest()[:16]
+        snippet = " ".join(t.split()[:80])
+        if snippet:
+            h = hashlib.sha256(snippet.encode("utf-8")).hexdigest()[:16]
             key = f"{source} | {h}"
-            ent[key] = {"status": _status_generic(text), "source": source, "date": "-", "time": "-", "kind": "-", "context": core[:300]}
-    return ent
+            out[key] = {"status": _status_generic(t), "source": source, "date": "-", "time": "-", "kind": "-", "context": snippet[:300]}
+    return out
 
 def parse_irsafam(html: str) -> Dict[str, dict]:
     soup = BeautifulSoup(html, "lxml")
     text = soup.get_text(separator=" ")
+    ent = _entries_from_status_scans(text, "Irsafam")
+    if ent:
+        return ent
     return _entries_from_text(text, "Irsafam")
 
 def parse_ieltstehran(html: str) -> Dict[str, dict]:
     soup = BeautifulSoup(html, "lxml")
-    text = _clean(soup.get_text(separator=" "))
-    ent: Dict[str, dict] = {}
-    for m in CAP_RE.finditer(text):
-        cap = m.group(1)
-        start = max(0, m.start() - 160)
-        end   = min(len(text), m.end() + 160)
-        win = text[start:end]
-        kd  = _kind(win) or "CDIELTS"
-        tm  = TIME_RE.search(win)
-        tstr = tm.group(1) if tm else "-"
-        date_val = "-"
-        best = None
-        for dm in DATE_RE_ASC.finditer(win):
-            dist = abs((start + dm.start()) - m.start())
-            if best is None or dist < best[0]:
-                best = (dist, dm.group())
-        if best is None:
-            for dm in DATE_RE_FA.finditer(win):
-                dist = abs((start + dm.start()) - m.start())
-                if best is None or dist < best[0]:
-                    best = (dist, _fa2en(dm.group()))
-        if best is not None:
-            date_val = best[1]
-        cap_l = cap.lower()
-        if "تکمیل" in cap_l or "full" in cap_l or "closed" in cap_l or "ناموجود" in cap_l or "پر" in cap_l:
-            st = "full"
-        elif "موجود" in cap_l or "open" in cap_l or "available" in cap_l or "خالی" in cap_l or "باز" in cap_l or "ثبت نام" in win or "رزرو" in win:
-            st = "open"
-        else:
-            st = "unknown"
-        key = " | ".join(x for x in ["IELTS Tehran", date_val, tstr, kd] if x)
-        ent[key] = {"status": st, "source": "IELTS Tehran", "date": date_val, "time": tstr, "kind": kd, "context": win[:300]}
+    text = soup.get_text(separator=" ")
+    ent = _entries_from_status_scans(text, "IELTS Tehran")
     if ent:
         return ent
     return _entries_from_text(text, "IELTS Tehran")
