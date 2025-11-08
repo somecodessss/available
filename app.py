@@ -54,10 +54,9 @@ STATUS_OPEN_TOKENS = (
     "ظرفیت: موجود", "ظرفیت موجود", "خالی", "باز", "در دسترس", "قابل رزرو",
     "ثبت نام", "رزرو", "available", "open", "book now", "register"
 )
-STATUS_CANCEL_TOKENS = ("لغو", "cancelled", "canceled")
 
 MONTHS = r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
-DATE_RE_ASC = re.compile(r"\b(?:\d{1,2}[/\.-]\d{1,2}[/\.-]\d{2,4}|\d{4}[/\.-]\d{1,2}[/\.-]\d{1,2})\b")
+DATE_RE_ASC = re.compile(r"\b(?:\d{1,2}[/\.-]\d{1,2}[/\.-]\d{2,4}|\d{4}[/\.-]\d{1,2}[/\.-]\d{1,2})\b", re.I)
 DATE_RE_MON1 = re.compile(rf"\b(?:\d{{1,2}}\s+(?:{MONTHS})\s+\d{{4}})\b", re.I)
 DATE_RE_MON2 = re.compile(rf"\b(?:(?:{MONTHS})\s+\d{{1,2}},?\s+\d{{4}})\b", re.I)
 DATE_RE_FA  = re.compile(r"[۰-۹]{1,2}[/\.-][۰-۹]{1,2}[/\.-][۰-۹]{2,4}|[۰-۹]{4}[/\.-][۰-۹]{1,2}[/\.-][۰-۹]{1,2}")
@@ -76,19 +75,9 @@ def _clean(t: str) -> str:
     t = t.replace("\u200c", " ").replace("\u200f", " ").replace("\u202a", " ").replace("\u202b", " ").replace("،", ",")
     return _ws(t)
 
-def _status_generic(win: str) -> str:
-    w = _clean(win).lower()
-    if any(tok.lower() in w for tok in STATUS_FULL_TOKENS):
-        return "full"
-    if any(tok.lower() in w for tok in STATUS_CANCEL_TOKENS):
-        return "canceled"
-    if any(tok.lower() in w for tok in STATUS_OPEN_TOKENS):
-        return "open"
-    return "unknown"
-
 def _kind(block: str) -> str:
     b = block.upper()
-    if "UKVI" in b or "CDUKVI" in b or "UKVI" in block:
+    if "UKVI" in b or "CDUKVI" in b:
         return "UKVI"
     if "CDIELTS" in b or "COMPUTER-DELIVERED" in b or "COMPUTER DELIVERED" in b or "CD " in b or "CD-" in b:
         return "CDIELTS"
@@ -131,85 +120,95 @@ async def _fetch(url: str) -> str:
             delay = min(4.0, delay * 1.5)
     return ""
 
-def _pick_date_near(text: str, anchor_start: int, start: int, end: int) -> str:
-    win = text[start:end]
-    best = None
-    for rx in (DATE_RE_ASC, DATE_RE_MON1, DATE_RE_MON2):
-        for dm in rx.finditer(win):
-            dist = abs((start + dm.start()) - anchor_start)
-            if best is None or dist < best[0]:
-                best = (dist, dm.group())
-    if best is None:
-        for dm in DATE_RE_FA.finditer(win):
-            dist = abs((start + dm.start()) - anchor_start)
-            if best is None or dist < best[0]:
-                best = (dist, _fa2en(dm.group()))
-    return best[1] if best else "-"
+def _pick_date_from_node(node_text: str) -> str:
+    t = _clean(node_text)
+    for rx in (DATE_RE_ASC, DATE_RE_MON1, DATE_RE_MON2, DATE_RE_FA):
+        m = rx.search(t)
+        if m:
+            g = m.group(0)
+            return _fa2en(g)
+    return "-"
 
-def _entries_from_status_scans(text: str, source: str) -> Dict[str, dict]:
-    t = _clean(text)
+def _pick_time_from_node(node_text: str) -> str:
+    t = _clean(node_text)
+    m = TIME_RE.search(t)
+    return _fa2en(m.group(1)) if m else "-"
+
+def _scan_blocks_for_status(soup: BeautifulSoup, source: str) -> Dict[str, dict]:
     ent: Dict[str, dict] = {}
-    for rx, st in ((FULL_RE, "full"), (OPEN_RE, "open")):
-        for m in rx.finditer(t):
-            start = max(0, m.start() - 220)
-            end = min(len(t), m.end() + 220)
-            win = t[start:end]
-            kd = _kind(win)
-            tm = TIME_RE.search(win)
-            tstr = _fa2en(tm.group(1)) if tm else "-"
-            dstr = _pick_date_near(t, m.start(), start, end)
-            key = " | ".join(x for x in [source, dstr, tstr, kd] if x)
-            ent[key] = {"status": st, "source": source, "date": dstr, "time": tstr, "kind": kd, "context": win[:300]}
-    if ent:
-        return ent
-    return {}
-
-def _entries_from_text(text: str, source: str) -> Dict[str, dict]:
-    t = _clean(text)
-    ent = _entries_from_status_scans(t, source)
-    if ent:
-        return ent
-    dates: List[tuple] = []
-    for rx in (DATE_RE_ASC, DATE_RE_MON1, DATE_RE_MON2):
-        for m in rx.finditer(t):
-            dates.append((m.group(), m.start(), m.end()))
-    for m in DATE_RE_FA.finditer(t):
-        dates.append((_fa2en(m.group()), m.start(), m.end()))
-    out: Dict[str, dict] = {}
-    if dates:
-        for d, s, e in dates:
-            start = max(0, s - 180)
-            end   = min(len(t), e + 180)
-            win = t[start:end]
-            st  = _status_generic(win)
-            kd  = _kind(win)
-            tm  = TIME_RE.search(win)
-            tstr = _fa2en(tm.group(1)) if tm else "-"
-            key = " | ".join(x for x in [source, d, tstr, kd] if x)
-            out[key] = {"status": st, "source": source, "date": d, "time": tstr, "kind": kd, "context": win[:300]}
-    else:
-        snippet = " ".join(t.split()[:80])
-        if snippet:
-            h = hashlib.sha256(snippet.encode("utf-8")).hexdigest()[:16]
-            key = f"{source} | {h}"
-            out[key] = {"status": _status_generic(t), "source": source, "date": "-", "time": "-", "kind": "-", "context": snippet[:300]}
-    return out
+    def capture(block_text: str, status: str):
+        kd = _kind(block_text)
+        dstr = _pick_date_from_node(block_text)
+        tstr = _pick_time_from_node(block_text)
+        key = " | ".join(x for x in [source, dstr, tstr, kd] if x)
+        ent[key] = {"status": status, "source": source, "date": dstr, "time": tstr, "kind": kd, "context": _clean(block_text)[:300]}
+    for tag in soup.find_all(text=FULL_RE):
+        blk = tag
+        for _ in range(6):
+            if getattr(blk, "parent", None) is None:
+                break
+            blk = blk.parent
+            txt = blk.get_text(separator=" ", strip=True)
+            if len(txt) > 40:
+                capture(txt, "full")
+                break
+    for tag in soup.find_all(text=OPEN_RE):
+        blk = tag
+        for _ in range(6):
+            if getattr(blk, "parent", None) is None:
+                break
+            blk = blk.parent
+            txt = blk.get_text(separator=" ", strip=True)
+            if len(txt) > 40:
+                capture(txt, "open")
+                break
+    return ent
 
 def parse_irsafam(html: str) -> Dict[str, dict]:
     soup = BeautifulSoup(html, "lxml")
-    text = soup.get_text(separator=" ")
-    ent = _entries_from_status_scans(text, "Irsafam")
+    ent = _scan_blocks_for_status(soup, "Irsafam")
     if ent:
         return ent
+    text = soup.get_text(separator=" ")
     return _entries_from_text(text, "Irsafam")
 
 def parse_ieltstehran(html: str) -> Dict[str, dict]:
     soup = BeautifulSoup(html, "lxml")
-    text = soup.get_text(separator=" ")
-    ent = _entries_from_status_scans(text, "IELTS Tehran")
+    ent = _scan_blocks_for_status(soup, "IELTS Tehran")
     if ent:
         return ent
+    text = soup.get_text(separator=" ")
     return _entries_from_text(text, "IELTS Tehran")
+
+def _entries_from_text(text: str, source: str) -> Dict[str, dict]:
+    t = _clean(text)
+    ent: Dict[str, dict] = {}
+    for m in FULL_RE.finditer(t):
+        start = max(0, m.start() - 220)
+        end = min(len(t), m.end() + 220)
+        win = t[start:end]
+        kd = _kind(win)
+        dstr = _pick_date_from_node(win)
+        tstr = _pick_time_from_node(win)
+        key = " | ".join(x for x in [source, dstr, tstr, kd] if x)
+        ent[key] = {"status": "full", "source": source, "date": dstr, "time": tstr, "kind": kd, "context": win[:300]}
+    for m in OPEN_RE.finditer(t):
+        start = max(0, m.start() - 220)
+        end = min(len(t), m.end() + 220)
+        win = t[start:end]
+        kd = _kind(win)
+        dstr = _pick_date_from_node(win)
+        tstr = _pick_time_from_node(win)
+        key = " | ".join(x for x in [source, dstr, tstr, kd] if x)
+        ent[key] = {"status": "open", "source": source, "date": dstr, "time": tstr, "kind": kd, "context": win[:300]}
+    if ent:
+        return ent
+    snippet = " ".join(t.split()[:80])
+    if snippet:
+        h = hashlib.sha256(snippet.encode("utf-8")).hexdigest()[:16]
+        key = f"{source} | {h}"
+        ent[key] = {"status": "full", "source": source, "date": "-", "time": "-", "kind": "-", "context": snippet[:300]}
+    return ent
 
 async def scrape_both() -> Dict[str, dict]:
     h1, h2 = await asyncio.gather(_fetch(URL_IRSAFAM), _fetch(URL_TEHRAN))
@@ -262,23 +261,20 @@ def embed_timetable(entries: Dict[str, dict]) -> discord.Embed:
     now = datetime.now(timezone.utc)
     e = discord.Embed(title="IELTS — Times & Availability", timestamp=now, color=0x2B2D31)
     groups = {
-        "Irsafam": {"open": [], "full": [], "unknown": []},
-        "IELTS Tehran": {"open": [], "full": [], "unknown": []},
+        "Irsafam": {"open": [], "full": []},
+        "IELTS Tehran": {"open": [], "full": []},
     }
     for v in entries.values():
         src = v.get("source", "Irsafam")
-        st  = v.get("status", "unknown")
+        st  = "open" if v.get("status") == "open" else "full"
         row = f"{v.get('date','-')} • {v.get('time','-')} • {v.get('kind','-')}"
         if st == "open":
-            groups.setdefault(src, {"open": [], "full": [], "unknown": []})["open"].append(f"🟢 {row}")
-        elif st == "full":
-            groups.setdefault(src, {"open": [], "full": [], "unknown": []})["full"].append(f"🔴 {row}")
+            groups.setdefault(src, {"open": [], "full": []})["open"].append(f"🟢 {row}")
         else:
-            groups.setdefault(src, {"open": [], "full": [], "unknown": []})["unknown"].append(f"⚪ {row}")
+            groups.setdefault(src, {"open": [], "full": []})["full"].append(f"🔴 {row}")
     for src in ("Irsafam", "IELTS Tehran"):
         e.add_field(name=f"{src} — Open", value=_field_text(groups[src]["open"][:20]), inline=False)
         e.add_field(name=f"{src} — Full", value=_field_text(groups[src]["full"][:20]), inline=False)
-        e.add_field(name=f"{src} — Unknown", value=_field_text(groups[src]["unknown"][:10]), inline=False)
     e.add_field(name="Sources", value=f"[Irsafam]({URL_IRSAFAM}) • [IELTS Tehran]({URL_TEHRAN})", inline=False)
     e.set_footer(text="Auto-refresh snapshot")
     return e
@@ -297,12 +293,10 @@ def embed_alert(open_changes: List[dict]) -> discord.Embed:
 def embed_panel(entries: Dict[str, dict]) -> discord.Embed:
     now = datetime.now(timezone.utc)
     total_open = sum(1 for v in entries.values() if v.get("status") == "open")
-    total_full = sum(1 for v in entries.values() if v.get("status") == "full")
-    total_unknown = sum(1 for v in entries.values() if v.get("status") == "unknown")
+    total_full = sum(1 for v in entries.values() if v.get("status") != "open")
     e = discord.Embed(title="IELTS Bot — Panel", timestamp=now, color=0x5865F2)
     e.add_field(name="Open", value=f"🟢 **{total_open}**", inline=True)
     e.add_field(name="Full", value=f"🔴 **{total_full}**", inline=True)
-    e.add_field(name="Unknown", value=f"⚪ **{total_unknown}**", inline=True)
     e.add_field(name="Slash Commands", value="`/timetable` • `/panel`", inline=False)
     e.add_field(name="Auto Announcements", value="Tags @everyone when seats open.", inline=False)
     return e
