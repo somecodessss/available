@@ -6,6 +6,7 @@ import hashlib
 from datetime import datetime, timezone
 from typing import Optional, Dict, List
 
+import logging
 import aiohttp
 import discord
 from discord.ext import tasks, commands
@@ -13,6 +14,8 @@ from discord import app_commands
 from bs4 import BeautifulSoup
 from fastapi import FastAPI
 import uvicorn
+
+discord.utils.setup_logging(level=logging.INFO)
 
 api = FastAPI()
 
@@ -89,7 +92,7 @@ async def ensure_http() -> aiohttp.ClientSession:
 async def _fetch(url: str) -> str:
     s = await ensure_http()
     bust = ("&" if "?" in url else "?") + f"t={int(datetime.now().timestamp())}"
-    hdrs = {"Cache-Control": "no-cache", "Pragma": "no-cache", "User-Agent": "ielts-availability-bot/1.5", "Accept-Language": "fa,en;q=0.8"}
+    hdrs = {"Cache-Control": "no-cache", "Pragma": "no-cache", "User-Agent": "ielts-availability-bot/1.6", "Accept-Language": "fa,en;q=0.8"}
     for _ in range(3):
         try:
             async with s.get(url + bust, headers=hdrs) as r:
@@ -257,26 +260,16 @@ def embed_panel(entries: Dict[str, dict]) -> discord.Embed:
 def _ephemeral_for(interaction: discord.Interaction) -> bool:
     return interaction.guild_id is not None
 
-async def _ensure_initial_response(interaction: discord.Interaction, ephemeral: bool) -> None:
-    if interaction.response.is_done():
-        return
+async def _respond(interaction: discord.Interaction, *, content: Optional[str] = None, embed: Optional[discord.Embed] = None, view: Optional[discord.ui.View] = None, ephemeral: Optional[bool] = None) -> None:
+    eph = _ephemeral_for(interaction) if ephemeral is None else ephemeral
     try:
-        await interaction.response.defer(ephemeral=ephemeral, thinking=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(content=content, embed=embed, view=view, ephemeral=eph)
+        else:
+            await interaction.edit_original_response(content=content, embed=embed, view=view)
     except Exception:
         try:
-            await interaction.response.send_message("\u200b", ephemeral=ephemeral)
-        except Exception:
-            pass
-
-async def _safe_edit_original(interaction: discord.Interaction, *, content: Optional[str] = None, embed: Optional[discord.Embed] = None, view: Optional[discord.ui.View] = None, ephemeral: bool) -> None:
-    try:
-        await interaction.edit_original_response(content=content, embed=embed, view=view)
-    except Exception:
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send(content=content, embed=embed, view=view, ephemeral=ephemeral)
-            else:
-                await interaction.response.send_message(content=content, embed=embed, view=view, ephemeral=ephemeral)
+            await interaction.followup.send(content=content, embed=embed, view=view, ephemeral=eph)
         except Exception:
             pass
 
@@ -309,45 +302,46 @@ ielts = app_commands.Group(name="ielts", description="IELTS availability tools")
 
 async def _refresh_and_edit(interaction: discord.Interaction):
     global _last_snapshot
-    ephemeral = _ephemeral_for(interaction)
     try:
         async with _poll_lock:
             fresh = await asyncio.wait_for(scrape_both(), timeout=8)
             _last_snapshot = fresh
-        await _safe_edit_original(interaction, embed=embed_timetable(fresh), view=SourceLinks(), ephemeral=ephemeral)
+        try:
+            await interaction.edit_original_response(embed=embed_timetable(fresh), view=SourceLinks())
+        except Exception:
+            await interaction.followup.send(embed=embed_timetable(fresh), view=SourceLinks(), ephemeral=_ephemeral_for(interaction))
     except Exception:
         pass
 
 @ielts.command(name="timetable", description="Show times and availability")
 async def cmd_timetable(interaction: discord.Interaction):
-    ephemeral = _ephemeral_for(interaction)
-    await _ensure_initial_response(interaction, ephemeral)
     data = _last_snapshot or load_state().get("entries", {})
-    await _safe_edit_original(interaction, embed=embed_timetable(data), view=SourceLinks(), ephemeral=ephemeral)
+    await _respond(interaction, embed=embed_timetable(data), view=SourceLinks())
     asyncio.create_task(_refresh_and_edit(interaction))
 
 @ielts.command(name="panel", description="Dashboard and quick links")
 async def cmd_panel(interaction: discord.Interaction):
-    ephemeral = _ephemeral_for(interaction)
-    await _ensure_initial_response(interaction, ephemeral)
     data = _last_snapshot or load_state().get("entries", {})
-    await _safe_edit_original(interaction, embed=embed_panel(data), view=SourceLinks(), ephemeral=ephemeral)
+    await _respond(interaction, embed=embed_panel(data), view=SourceLinks())
 
 @ielts.command(name="refresh", description="Force an immediate scrape")
 async def cmd_refresh(interaction: discord.Interaction):
-    global _last_snapshot
-    ephemeral = _ephemeral_for(interaction)
-    await _ensure_initial_response(interaction, ephemeral)
     try:
         async with _poll_lock:
             data = await asyncio.wait_for(scrape_both(), timeout=10)
             save_state({"entries": data})
-            _last_snapshot = data
-        await _safe_edit_original(interaction, content="Refreshed.", embed=None, view=None, ephemeral=ephemeral)
+        await _respond(interaction, content="Refreshed.")
     except Exception:
-        await _safe_edit_original(interaction, content="Refresh failed.", embed=None, view=None, ephemeral=ephemeral)
+        await _respond(interaction, content="Refresh failed.")
 
 tree.add_command(ielts)
+
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    try:
+        await _respond(interaction, content="Command error.")
+    except Exception:
+        pass
 
 @bot.event
 async def on_ready():
@@ -362,7 +356,7 @@ async def on_ready():
                 await tree.sync(guild=g)
             await tree.sync()
     except Exception as e:
-        print(f"Sync error: {e}")
+        logging.exception("Sync error: %s", e)
 
 async def _run_http():
     port = int(os.environ.get("PORT", "8000"))
@@ -385,8 +379,11 @@ async def _keep_render_awake():
             pass
         await asyncio.sleep(240)
 
+async def _run_bot():
+    await bot.start(TOKEN)
+
 async def main():
-    await asyncio.gather(_run_http(), _keep_render_awake(), bot.start(TOKEN))
+    await asyncio.gather(_run_http(), _keep_render_awake(), _run_bot())
 
 if __name__ == "__main__":
     asyncio.run(main())
