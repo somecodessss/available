@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 import aiohttp
 import discord
-from discord.ext import tasks
+from discord.ext import tasks, commands
 from discord import app_commands
 from bs4 import BeautifulSoup
 from fastapi import FastAPI
@@ -23,31 +23,39 @@ TOKEN = os.environ["DISCORD_TOKEN"]
 CHANNEL_ID = int(os.environ["DISCORD_CHANNEL_ID"])
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
-POLL_INTERVAL_MINUTES = int(os.getenv("POLL_INTERVAL_MINUTES", "5"))
 URL_IRSAFAM = os.getenv("TIMETABLE_URL", "https://irsafam.org/ielts/timetable")
 URL_TEHRAN = os.getenv("TIMETABLE_URL_2", "https://ieltstehran.com/computer-delivered-ielts-exam/")
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", str(int(os.getenv("POLL_INTERVAL_MINUTES", "1")) * 60)))
 
 intents = discord.Intents.default()
-client = discord.Client(intents=intents, allowed_mentions=discord.AllowedMentions(everyone=True))
-tree = app_commands.CommandTree(client)
+bot = commands.Bot(command_prefix="!", intents=intents, allowed_mentions=discord.AllowedMentions(everyone=True))
+tree = bot.tree
 
-def normalize_ws(t: str) -> str:
-    return re.sub(r"\s+", " ", t.strip())
-
-def fa_to_en_digits(s: str) -> str:
-    return s.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789"))
-
-def cleanse_text(t: str) -> str:
-    t = fa_to_en_digits(t)
-    t = t.replace("٫", ":").replace("ː", ":").replace("،", ",")
-    return normalize_ws(t)
+_http: aiohttp.ClientSession | None = None
+_last_snapshot: dict = {}
+_poll_lock = asyncio.Lock()
 
 STATUS_FULL_PATTERNS = ("ظرفیت: تکمیل", "ظرفیت تکمیل", "تکمیل ظرفیت", "full", "closed", "no seats", "sold out")
 STATUS_OPEN_PATTERNS = ("ظرفیت: موجود", "ظرفیت موجود", "available", "open", "ثبت نام", "ثبت‌نام", "رزرو", "reserve", "book")
 STATUS_CANCELED_PATTERNS = ("لغو", "cancelled", "canceled")
 
-def status_from_text(window: str) -> str:
-    w = cleanse_text(window).lower()
+DATE_RE_ASC = re.compile(r"\b(?:\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}[/.-]\d{1,2}[/.-]\d{1,2})\b")
+DATE_RE_FA = re.compile(r"[۰-۹]{1,2}[/\.-][۰-۹]{1,2}[/\.-][۰-۹]{2,4}|[۰-۹]{4}[/\.-][۰-۹]{1,2}[/\.-][۰-۹]{1,2}")
+TIME_RE = re.compile(r"(?:ساعت\s*)?(\d{1,2}:\d{2}|\d{1,2}\s*(?:am|pm|AM|PM))\b")
+
+def _ws(t: str) -> str:
+    return re.sub(r"\s+", " ", t.strip())
+
+def _fa2en(s: str) -> str:
+    return s.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789"))
+
+def _clean(t: str) -> str:
+    t = _fa2en(t)
+    t = t.replace("٫", ":").replace("ː", ":").replace("،", ",")
+    return _ws(t)
+
+def _status(win: str) -> str:
+    w = _clean(win).lower()
     full_hit = any(p.lower() in w for p in STATUS_FULL_PATTERNS)
     open_hit = any(p.lower() in w for p in STATUS_OPEN_PATTERNS)
     cancel_hit = any(p.lower() in w for p in STATUS_CANCELED_PATTERNS)
@@ -61,11 +69,7 @@ def status_from_text(window: str) -> str:
         return "open"
     return "unknown"
 
-DATE_RE_ASC = re.compile(r"\b(?:\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}[/.-]\d{1,2}[/.-]\d{1,2})\b")
-DATE_RE_FA = re.compile(r"[۰-۹]{1,2}[/\.-][۰-۹]{1,2}[/\.-][۰-۹]{2,4}|[۰-۹]{4}[/\.-][۰-۹]{1,2}[/\.-][۰-۹]{1,2}")
-TIME_RE = re.compile(r"(?:ساعت\s*)?(\d{1,2}:\d{2}|\d{1,2}\s*(?:am|pm|AM|PM))\b")
-
-def extract_kind(block: str) -> str:
+def _kind(block: str) -> str:
     b = block.upper()
     if "UKVI" in b:
         return "UKVI"
@@ -75,94 +79,111 @@ def extract_kind(block: str) -> str:
         return "IELTS"
     return "-"
 
-def parse_generic_text(html: str, source: str) -> dict:
-    soup = BeautifulSoup(html, "lxml")
-    text = cleanse_text(soup.get_text(separator=" "))
+async def _fetch(url: str) -> str:
+    assert _http is not None
+    q = "&" if "?" in url else "?"
+    bust = f"{q}t={int(datetime.now().timestamp())}"
+    hdrs = {"Cache-Control": "no-cache", "Pragma": "no-cache", "User-Agent": "ielts-availability-bot/1.2", "Accept-Language": "fa,en;q=0.8"}
+    async with _http.get(url + bust, headers=hdrs, timeout=aiohttp.ClientTimeout(total=25, connect=10)) as r:
+        return await r.text()
+
+def _entries_from_text(text: str, source: str) -> dict:
     dates = []
     for m in DATE_RE_ASC.finditer(text):
         dates.append((m.group(), m.start(), m.end()))
     for m in DATE_RE_FA.finditer(text):
-        dates.append((fa_to_en_digits(m.group()), m.start(), m.end()))
-    entries = {}
+        dates.append((_fa2en(m.group()), m.start(), m.end()))
+    ent = {}
     if dates:
         for d, s, e in dates:
             start = max(0, s - 180)
             end = min(len(text), e + 180)
-            window = text[start:end]
-            status = status_from_text(window)
-            kind = extract_kind(window)
-            tm = TIME_RE.search(window)
-            time_str = tm.group(1) if tm else "-"
-            key = " | ".join(x for x in [source, d, time_str, kind] if x)
-            entries[key] = {"status": status, "source": source, "date": d, "time": time_str, "kind": kind, "context": window[:300]}
+            win = text[start:end]
+            st = _status(win)
+            kd = _kind(win)
+            tm = TIME_RE.search(win)
+            tstr = tm.group(1) if tm else "-"
+            key = " | ".join(x for x in [source, d, tstr, kd] if x)
+            ent[key] = {"status": st, "source": source, "date": d, "time": tstr, "kind": kd, "context": win[:300]}
     else:
         h = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
         key = f"{source} | {h}"
-        entries[key] = {"status": status_from_text(text), "source": source, "date": "-", "time": "-", "kind": "-", "context": text[:300]}
-    return entries
+        ent[key] = {"status": _status(text), "source": source, "date": "-", "time": "-", "kind": "-", "context": text[:300]}
+    return ent
 
-def parse_irsafam(html: str) -> dict:
-    return parse_generic_text(html, "Irsafam")
-
-def parse_ieltstehran(html: str) -> dict:
+def _parse_irsafam(html: str) -> dict:
     soup = BeautifulSoup(html, "lxml")
-    text = cleanse_text(soup.get_text(separator=" "))
-    entries = {}
-    for m in re.finditer(r"ظرفیت\s*[:]\s*([^\s،,]+)", text):
+    text = _clean(soup.get_text(separator=" "))
+    return _entries_from_text(text, "Irsafam")
+
+def _parse_ieltstehran(html: str) -> dict:
+    soup = BeautifulSoup(html, "lxml")
+    text = _clean(soup.get_text(separator=" "))
+    ent = {}
+    for m in re.finditer(r"ظرفیت\s*[:：]\s*([^\s،,]+)", text):
         cap = m.group(1)
-        start = max(0, m.start() - 200)
-        end = min(len(text), m.end() + 200)
-        window = text[start:end]
+        start = max(0, m.start() - 160)
+        end = min(len(text), m.end() + 160)
+        win = text[start:end]
+        kd = _kind(win) or "CDIELTS"
+        tm = TIME_RE.search(win)
+        tstr = tm.group(1) if tm else "-"
         date_val = "-"
-        nearest = None
-        for dm in DATE_RE_ASC.finditer(window):
+        best = None
+        for dm in DATE_RE_ASC.finditer(win):
             dist = abs((start + dm.start()) - m.start())
-            if nearest is None or dist < nearest[0]:
-                nearest = (dist, dm.group())
-        if nearest is None:
-            for dm in DATE_RE_FA.finditer(window):
+            if best is None or dist < best[0]:
+                best = (dist, dm.group())
+        if best is None:
+            for dm in DATE_RE_FA.finditer(win):
                 dist = abs((start + dm.start()) - m.start())
-                if nearest is None or dist < nearest[0]:
-                    nearest = (dist, fa_to_en_digits(dm.group()))
-        if nearest is not None:
-            date_val = nearest[1]
-        tm = TIME_RE.search(window)
-        time_str = tm.group(1) if tm else "-"
-        kind = extract_kind(window)
+                if best is None or dist < best[0]:
+                    best = (dist, _fa2en(dm.group()))
+        if best is not None:
+            date_val = best[1]
         cap_l = cap.lower()
         if ("تکمیل" in cap_l) or ("full" in cap_l):
             st = "full"
         elif ("موجود" in cap_l) or ("available" in cap_l) or ("open" in cap_l):
             st = "open"
         else:
-            st = status_from_text(window)
-        key = " | ".join(x for x in ["IELTS Tehran", date_val, time_str, kind] if x)
-        entries[key] = {"status": st, "source": "IELTS Tehran", "date": date_val, "time": time_str, "kind": kind, "context": window[:300]}
-    if entries:
-        return entries
-    return parse_generic_text(html, "IELTS Tehran")
+            st = _status(win)
+            if st == "open" and ("تکمیل" in win or "ظرفیت تکمیل" in win or "تکمیل ظرفیت" in win or "full" in win or "closed" in win):
+                st = "full"
+        key = " | ".join(x for x in ["IELTS Tehran", date_val, tstr, kd] if x)
+        ent[key] = {"status": st, "source": "IELTS Tehran", "date": date_val, "time": tstr, "kind": kd, "context": win[:300]}
+    if ent:
+        return ent
+    return _entries_from_text(text, "IELTS Tehran")
 
-def load_state(path: str) -> dict:
-    if os.path.exists(path):
+async def scrape() -> dict:
+    h1, h2 = await asyncio.gather(_fetch(URL_IRSAFAM), _fetch(URL_TEHRAN))
+    e1 = _parse_irsafam(h1)
+    e2 = _parse_ieltstehran(h2)
+    m = {**e1, **e2}
+    return m
+
+def _load_state() -> dict:
+    if os.path.exists(STATE_FILE):
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             return {"entries": {}}
     return {"entries": {}}
 
-def save_state(path: str, obj: dict) -> None:
-    with open(path, "w", encoding="utf-8") as f:
+def _save_state(obj: dict) -> None:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
-def diff(prev: dict, curr: dict) -> list:
+def _diff(prev: dict, curr: dict) -> list:
     changes = []
-    prev_map = prev.get("entries", {}) if "entries" in prev else prev
-    curr_map = curr.get("entries", {}) if "entries" in curr else curr
-    keys = set(prev_map.keys()) | set(curr_map.keys())
+    p = prev.get("entries", {}) if "entries" in prev else prev
+    c = curr.get("entries", {}) if "entries" in curr else curr
+    keys = set(p.keys()) | set(c.keys())
     for k in sorted(keys):
-        pv = prev_map.get(k)
-        cv = curr_map.get(k)
+        pv = p.get(k)
+        cv = c.get(k)
         if pv is None:
             changes.append({"key": k, "type": "added", "from": None, "to": cv["status"], "entry": cv})
         elif cv is None:
@@ -171,53 +192,38 @@ def diff(prev: dict, curr: dict) -> list:
             changes.append({"key": k, "type": "changed", "from": pv["status"], "to": cv["status"], "entry": cv})
     return changes
 
-_http_session: aiohttp.ClientSession | None = None
-
-async def fetch_text(url: str) -> str:
-    assert _http_session is not None
-    async with _http_session.get(url, headers={"Cache-Control": "no-cache", "Pragma": "no-cache", "User-Agent": "availability-bot/1.1"}, timeout=aiohttp.ClientTimeout(total=25, connect=10)) as r:
-        return await r.text()
-
-async def scrape_both() -> dict:
-    html1, html2 = await asyncio.gather(fetch_text(URL_IRSAFAM), fetch_text(URL_TEHRAN))
-    e1 = parse_irsafam(html1)
-    e2 = parse_ieltstehran(html2)
-    merged = {**e1, **e2}
-    return merged
-
-def _field_text(lines: list[str]) -> str:
+def _field_txt(lines: list[str]) -> str:
     if not lines:
         return "—"
     s = "\n".join(lines)
     return s[:1024] if len(s) > 1024 else s
 
-class SourceLinks(discord.ui.View):
+class Links(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(discord.ui.Button(label="Irsafam", url=URL_IRSAFAM))
         self.add_item(discord.ui.Button(label="IELTS Tehran", url=URL_TEHRAN))
 
-def build_embed(entries: dict) -> discord.Embed:
+def embed_timetable(entries: dict) -> discord.Embed:
     now = datetime.now(timezone.utc)
-    color = 0x2B2D31
-    e = discord.Embed(title="IELTS Schedules — Times & Availability", timestamp=now, color=color)
+    e = discord.Embed(title="AAA — IELTS Schedules", timestamp=now, color=0x2B2D31)
     groups = {"Irsafam": {"open": [], "full": []}, "IELTS Tehran": {"open": [], "full": []}}
     for v in entries.values():
         src = v.get("source", "Irsafam")
-        status = v.get("status", "unknown")
+        st = v.get("status", "unknown")
         row = f"{v.get('date','-')} • {v.get('time','-')} • {v.get('kind','-')}"
-        if status == "open":
+        if st == "open":
             groups.setdefault(src, {"open": [], "full": []})["open"].append(f"🟢 {row}")
-        elif status == "full":
+        elif st == "full":
             groups.setdefault(src, {"open": [], "full": []})["full"].append(f"🔴 {row}")
     for src in ("Irsafam", "IELTS Tehran"):
-        e.add_field(name=f"{src} — Open", value=_field_text(groups[src]["open"][:20]), inline=False)
-        e.add_field(name=f"{src} — Full", value=_field_text(groups[src]["full"][:20]), inline=False)
-    e.add_field(name="Sources", value=f"[Irsafam]({URL_IRSAFAM}) • [IELTS Tehran]({URL_TEHRAN})", inline=False)
-    e.set_footer(text="Ephemeral snapshot")
+        e.add_field(name=f"{src} — Open", value=_field_txt(groups[src]["open"][:20]), inline=False)
+        e.add_field(name=f"{src} — Full", value=_field_txt(groups[src]["full"][:20]), inline=False)
+    e.add_field(name="Links", value=f"[Irsafam]({URL_IRSAFAM}) • [IELTS Tehran]({URL_TEHRAN})", inline=False)
+    e.set_footer(text="Ephemeral")
     return e
 
-def build_open_alert_embed(open_changes: list) -> discord.Embed:
+def embed_alert(open_changes: list) -> discord.Embed:
     now = datetime.now(timezone.utc)
     e = discord.Embed(title="Seats Available — Alert", timestamp=now, color=0x57F287)
     lines = []
@@ -228,68 +234,83 @@ def build_open_alert_embed(open_changes: list) -> discord.Embed:
     e.add_field(name="Links", value=f"[Irsafam]({URL_IRSAFAM}) • [IELTS Tehran]({URL_TEHRAN})", inline=False)
     return e
 
-def build_panel_embed(entries: dict) -> discord.Embed:
+def embed_panel(entries: dict, last_run: datetime | None) -> discord.Embed:
     now = datetime.now(timezone.utc)
     total_open = sum(1 for v in entries.values() if v.get("status") == "open")
     total_full = sum(1 for v in entries.values() if v.get("status") == "full")
-    e = discord.Embed(title="IELTS Bot — Panel", timestamp=now, color=0x5865F2)
-    e.add_field(name="Totals", value=f"🟢 Open: **{total_open}**\n🔴 Full: **{total_full}**", inline=True)
-    e.add_field(name="Commands", value="`/ielts timetable` — show times & availability\n`/ielts panel` — overview & links", inline=True)
-    e.add_field(name="Announcements", value="Auto-alerts tag @everyone when seats open.", inline=False)
+    e = discord.Embed(title="AAA — IELTS Bot Panel", timestamp=now, color=0x5865F2)
+    e.add_field(name="Counts", value=f"🟢 Open: **{total_open}**\n🔴 Full: **{total_full}**", inline=True)
+    e.add_field(name="Commands", value="`/ielts timetable` • `/ielts panel` • `/ielts refresh`", inline=True)
+    if last_run:
+        e.add_field(name="Last Check", value=f"{last_run.isoformat()}Z", inline=False)
+    e.add_field(name="Links", value=f"[Irsafam]({URL_IRSAFAM}) • [IELTS Tehran]({URL_TEHRAN})", inline=False)
     return e
 
-@tasks.loop(minutes=POLL_INTERVAL_MINUTES)
+@tasks.loop(seconds=POLL_INTERVAL_SECONDS)
 async def poll():
-    try:
-        current = await scrape_both()
-    except Exception:
-        return
-    state = load_state(STATE_FILE)
-    previous = state.get("entries", {})
-    changes = diff({"entries": previous}, {"entries": current})
-    if changes:
-        save_state(STATE_FILE, {"entries": current})
-        open_changes = [c for c in changes if c["to"] == "open"]
-        if open_changes:
-            ch = client.get_channel(CHANNEL_ID)
-            if ch is None:
-                try:
-                    ch = await client.fetch_channel(CHANNEL_ID)
-                except Exception:
-                    ch = None
-            if ch:
-                embed = build_open_alert_embed(open_changes)
-                await ch.send(content="@everyone", embed=embed, allowed_mentions=discord.AllowedMentions(everyone=True), view=SourceLinks())
+    async with _poll_lock:
+        try:
+            current = await scrape()
+        except Exception:
+            return
+        prev_state = _load_state()
+        prev = prev_state.get("entries", {})
+        changes = _diff({"entries": prev}, {"entries": current})
+        if changes:
+            _save_state({"entries": current})
+            open_changes = [c for c in changes if c["to"] == "open"]
+            if open_changes:
+                ch = bot.get_channel(CHANNEL_ID)
+                if ch is None:
+                    try:
+                        ch = await bot.fetch_channel(CHANNEL_ID)
+                    except Exception:
+                        ch = None
+                if ch:
+                    await ch.send(content="@everyone", embed=embed_alert(open_changes), allowed_mentions=discord.AllowedMentions(everyone=True), view=Links())
+        global _last_snapshot
+        _last_snapshot = current
 
 ielts = app_commands.Group(name="ielts", description="IELTS tools")
 
-@ielts.command(name="timetable", description="Show IELTS timetable times and availability")
+@ielts.command(name="timetable", description="Times and availability from Irsafam + IELTS Tehran")
 async def cmd_timetable(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
-    try:
-        entries = await scrape_both()
-    except Exception:
-        await interaction.followup.send("Failed to fetch timetables.", ephemeral=True)
-        return
-    await interaction.followup.send(embed=build_embed(entries), ephemeral=True, view=SourceLinks())
+    async with _poll_lock:
+        try:
+            data = await scrape()
+            global _last_snapshot
+            _last_snapshot = data
+            await interaction.followup.send(embed=embed_timetable(data), ephemeral=True, view=Links())
+        except Exception:
+            await interaction.followup.send("Fetch failed.", ephemeral=True)
 
-@ielts.command(name="panel", description="Bot panel, counts, links")
+@ielts.command(name="panel", description="Dashboard and quick links")
 async def cmd_panel(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
-    try:
-        entries = await scrape_both()
-    except Exception:
-        await interaction.followup.send("Failed to fetch data.", ephemeral=True)
-        return
-    await interaction.followup.send(embed=build_panel_embed(entries), ephemeral=True, view=SourceLinks())
+    data = _last_snapshot or _load_state().get("entries", {})
+    await interaction.followup.send(embed=embed_panel(data, datetime.now(timezone.utc)), ephemeral=True, view=Links())
+
+@ielts.command(name="refresh", description="Force an immediate scrape")
+async def cmd_refresh(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    async with _poll_lock:
+        try:
+            data = await scrape()
+            _save_state({"entries": data})
+            global _last_snapshot
+            _last_snapshot = data
+            await interaction.followup.send("Refreshed.", ephemeral=True)
+        except Exception:
+            await interaction.followup.send("Refresh failed.", ephemeral=True)
 
 tree.add_command(ielts)
 
-@client.event
+@bot.event
 async def on_ready():
-    global _http_session
-    if _http_session is None or _http_session.closed:
-        _http_session = aiohttp.ClientSession()
+    global _http
+    if _http is None or _http.closed:
+        _http = aiohttp.ClientSession()
     if not poll.is_running():
         poll.start()
     try:
@@ -323,7 +344,7 @@ async def _keep_render_awake():
             await asyncio.sleep(240)
 
 async def main():
-    await asyncio.gather(_run_http(), _keep_render_awake(), client.start(TOKEN))
+    await asyncio.gather(_run_http(), _keep_render_awake(), bot.start(TOKEN))
 
 if __name__ == "__main__":
     asyncio.run(main())
