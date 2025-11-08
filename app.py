@@ -312,8 +312,7 @@ async def _refresh_and_edit(interaction: discord.Interaction):
         except Exception:
             pass
 
-@ielts.command(name="timetable", description="Show times and availability")
-async def cmd_timetable(interaction: discord.Interaction):
+async def handle_timetable(interaction: discord.Interaction):
     await _ack(interaction)
     data = _last_snapshot or load_state().get("entries", {})
     try:
@@ -322,8 +321,7 @@ async def cmd_timetable(interaction: discord.Interaction):
         await interaction.followup.send(embed=embed_timetable(data), view=SourceLinks())
     asyncio.create_task(_refresh_and_edit(interaction))
 
-@ielts.command(name="panel", description="Dashboard and quick links")
-async def cmd_panel(interaction: discord.Interaction):
+async def handle_panel(interaction: discord.Interaction):
     await _ack(interaction)
     data = _last_snapshot or load_state().get("entries", {})
     try:
@@ -331,8 +329,7 @@ async def cmd_panel(interaction: discord.Interaction):
     except Exception:
         await interaction.followup.send(embed=embed_panel(data), view=SourceLinks())
 
-@ielts.command(name="refresh", description="Force an immediate scrape")
-async def cmd_refresh(interaction: discord.Interaction):
+async def handle_refresh(interaction: discord.Interaction):
     await _ack(interaction)
     try:
         async with _poll_lock:
@@ -351,18 +348,43 @@ async def cmd_refresh(interaction: discord.Interaction):
         except Exception:
             await interaction.followup.send(content="Refresh failed.")
 
+@ielts.command(name="timetable", description="Show times and availability")
+async def group_timetable(interaction: discord.Interaction):
+    await handle_timetable(interaction)
+
+@ielts.command(name="panel", description="Dashboard and quick links")
+async def group_panel(interaction: discord.Interaction):
+    await handle_panel(interaction)
+
+@ielts.command(name="refresh", description="Force an immediate scrape")
+async def group_refresh(interaction: discord.Interaction):
+    await handle_refresh(interaction)
+
+@tree.command(name="timetable", description="Show times and availability")
+async def root_timetable(interaction: discord.Interaction):
+    await handle_timetable(interaction)
+
+@tree.command(name="panel", description="Dashboard and quick links")
+async def root_panel(interaction: discord.Interaction):
+    await handle_panel(interaction)
+
+@tree.command(name="refresh", description="Force an immediate scrape")
+async def root_refresh(interaction: discord.Interaction):
+    await handle_refresh(interaction)
+
 tree.add_command(ielts)
 
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    logging.exception("App command error: %s", error)
+    logging.exception("App command error", exc_info=error)
+    msg = f"{type(error).__name__}: {error}"
     try:
         if not interaction.response.is_done():
-            await interaction.response.send_message("Command error.", ephemeral=False)
+            await interaction.response.send_message(msg, ephemeral=True)
         else:
-            await interaction.followup.send("Command error.", ephemeral=False)
-    except Exception as e:
-        logging.warning("Error handler failed: %s", e)
+            await interaction.followup.send(msg, ephemeral=True)
+    except Exception:
+        pass
 
 @bot.event
 async def on_ready():
