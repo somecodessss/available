@@ -15,6 +15,7 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI
 import uvicorn
 
+logging.basicConfig(level=logging.INFO)
 discord.utils.setup_logging(level=logging.INFO)
 
 api = FastAPI()
@@ -36,6 +37,7 @@ URL_TEHRAN = os.getenv("TIMETABLE_URL_2", "https://ieltstehran.com/computer-deli
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "45"))
 
 intents = discord.Intents.default()
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, allowed_mentions=discord.AllowedMentions(everyone=True))
 tree = bot.tree
 
@@ -92,7 +94,7 @@ async def ensure_http() -> aiohttp.ClientSession:
 async def _fetch(url: str) -> str:
     s = await ensure_http()
     bust = ("&" if "?" in url else "?") + f"t={int(datetime.now().timestamp())}"
-    hdrs = {"Cache-Control": "no-cache", "Pragma": "no-cache", "User-Agent": "ielts-availability-bot/1.6", "Accept-Language": "fa,en;q=0.8"}
+    hdrs = {"Cache-Control": "no-cache", "Pragma": "no-cache", "User-Agent": "ielts-availability-bot/1.7", "Accept-Language": "fa,en;q=0.8"}
     for _ in range(3):
         try:
             async with s.get(url + bust, headers=hdrs) as r:
@@ -257,28 +259,20 @@ def embed_panel(entries: Dict[str, dict]) -> discord.Embed:
     e.add_field(name="Auto Announcements", value="Tags @everyone when seats open.", inline=False)
     return e
 
-def _ephemeral_for(interaction: discord.Interaction) -> bool:
-    return interaction.guild_id is not None
-
-async def _respond(interaction: discord.Interaction, *, content: Optional[str] = None, embed: Optional[discord.Embed] = None, view: Optional[discord.ui.View] = None, ephemeral: Optional[bool] = None) -> None:
-    eph = _ephemeral_for(interaction) if ephemeral is None else ephemeral
-    try:
-        if not interaction.response.is_done():
-            await interaction.response.send_message(content=content, embed=embed, view=view, ephemeral=eph)
-        else:
-            await interaction.edit_original_response(content=content, embed=embed, view=view)
-    except Exception:
+async def _ack(interaction: discord.Interaction) -> None:
+    if not interaction.response.is_done():
         try:
-            await interaction.followup.send(content=content, embed=embed, view=view, ephemeral=eph)
-        except Exception:
-            pass
+            await interaction.response.defer(thinking=True)
+        except Exception as e:
+            logging.warning("Defer failed: %s", e)
 
 @tasks.loop(seconds=POLL_INTERVAL_SECONDS)
 async def poll():
     async with _poll_lock:
         try:
             current = await scrape_both()
-        except Exception:
+        except Exception as e:
+            logging.warning("Scrape error: %s", e)
             return
         state = load_state()
         prev = state.get("entries", {})
@@ -291,7 +285,8 @@ async def poll():
                 if ch is None:
                     try:
                         ch = await bot.fetch_channel(CHANNEL_ID)
-                    except Exception:
+                    except Exception as e:
+                        logging.warning("Channel fetch error: %s", e)
                         ch = None
                 if ch:
                     await ch.send(content="@everyone", embed=embed_alert(open_changes), allowed_mentions=discord.AllowedMentions(everyone=True), view=SourceLinks())
@@ -309,39 +304,65 @@ async def _refresh_and_edit(interaction: discord.Interaction):
         try:
             await interaction.edit_original_response(embed=embed_timetable(fresh), view=SourceLinks())
         except Exception:
-            await interaction.followup.send(embed=embed_timetable(fresh), view=SourceLinks(), ephemeral=_ephemeral_for(interaction))
-    except Exception:
-        pass
+            await interaction.followup.send(embed=embed_timetable(fresh), view=SourceLinks())
+    except Exception as e:
+        logging.exception("Refresh/edit error: %s", e)
+        try:
+            await interaction.followup.send(content="Error refreshing.")
+        except Exception:
+            pass
 
 @ielts.command(name="timetable", description="Show times and availability")
 async def cmd_timetable(interaction: discord.Interaction):
+    await _ack(interaction)
     data = _last_snapshot or load_state().get("entries", {})
-    await _respond(interaction, embed=embed_timetable(data), view=SourceLinks())
+    try:
+        await interaction.edit_original_response(embed=embed_timetable(data), view=SourceLinks())
+    except Exception:
+        await interaction.followup.send(embed=embed_timetable(data), view=SourceLinks())
     asyncio.create_task(_refresh_and_edit(interaction))
 
 @ielts.command(name="panel", description="Dashboard and quick links")
 async def cmd_panel(interaction: discord.Interaction):
+    await _ack(interaction)
     data = _last_snapshot or load_state().get("entries", {})
-    await _respond(interaction, embed=embed_panel(data), view=SourceLinks())
+    try:
+        await interaction.edit_original_response(embed=embed_panel(data), view=SourceLinks())
+    except Exception:
+        await interaction.followup.send(embed=embed_panel(data), view=SourceLinks())
 
 @ielts.command(name="refresh", description="Force an immediate scrape")
 async def cmd_refresh(interaction: discord.Interaction):
+    await _ack(interaction)
     try:
         async with _poll_lock:
             data = await asyncio.wait_for(scrape_both(), timeout=10)
             save_state({"entries": data})
-        await _respond(interaction, content="Refreshed.")
-    except Exception:
-        await _respond(interaction, content="Refresh failed.")
+            global _last_snapshot
+            _last_snapshot = data
+        try:
+            await interaction.edit_original_response(content="Refreshed.")
+        except Exception:
+            await interaction.followup.send(content="Refreshed.")
+    except Exception as e:
+        logging.exception("Refresh command failed: %s", e)
+        try:
+            await interaction.edit_original_response(content="Refresh failed.")
+        except Exception:
+            await interaction.followup.send(content="Refresh failed.")
 
 tree.add_command(ielts)
 
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    logging.exception("App command error: %s", error)
     try:
-        await _respond(interaction, content="Command error.")
-    except Exception:
-        pass
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Command error.", ephemeral=False)
+        else:
+            await interaction.followup.send("Command error.", ephemeral=False)
+    except Exception as e:
+        logging.warning("Error handler failed: %s", e)
 
 @bot.event
 async def on_ready():
@@ -355,6 +376,7 @@ async def on_ready():
             for g in bot.guilds:
                 await tree.sync(guild=g)
             await tree.sync()
+        logging.info("Synced commands. Guilds: %s", [g.id for g in bot.guilds])
     except Exception as e:
         logging.exception("Sync error: %s", e)
 
