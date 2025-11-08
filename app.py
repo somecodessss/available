@@ -14,7 +14,6 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI
 import uvicorn
 
-# ------------------- HTTP (Render health) -------------------
 api = FastAPI()
 
 @api.get("/")
@@ -25,32 +24,30 @@ async def root():
 async def health():
     return {"ok": True}
 
-# ------------------- Config -------------------
 TOKEN = os.environ["DISCORD_TOKEN"]
 CHANNEL_ID = int(os.environ["DISCORD_CHANNEL_ID"])
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
-
 URL_IRSAFAM = os.getenv("TIMETABLE_URL", "https://irsafam.org/ielts/timetable")
 URL_TEHRAN = os.getenv("TIMETABLE_URL_2", "https://ieltstehran.com/computer-delivered-ielts-exam/")
-
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "45"))
 
-# ------------------- Discord -------------------
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents, allowed_mentions=discord.AllowedMentions(everyone=True))
 tree = bot.tree
 
-# ------------------- HTTP session -------------------
 _http: Optional[aiohttp.ClientSession] = None
+_last_snapshot: Dict[str, dict] = {}
+_poll_lock = asyncio.Lock()
 
-async def ensure_http() -> aiohttp.ClientSession:
-    global _http
-    if _http is None or _http.closed:
-        _http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25, connect=10))
-    return _http
+STATUS_FULL_PATTERNS = ("ظرفیت: تکمیل", "ظرفیت تکمیل", "تکمیل ظرفیت", "full", "closed", "sold out", "no seats")
+STATUS_OPEN_PATTERNS = ("ظرفیت: موجود", "ظرفیت موجود", "available", "open", "ثبت نام", "ثبت‌نام", "رزرو", "reserve", "book")
+STATUS_CANCELED_PATTERNS = ("لغو", "cancelled", "canceled")
 
-# ------------------- Text utils -------------------
+DATE_RE_ASC = re.compile(r"\b(?:\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}[/.-]\d{1,2}[/.-]\d{1,2})\b")
+DATE_RE_FA  = re.compile(r"[۰-۹]{1,2}[/\.-][۰-۹]{1,2}[/\.-][۰-۹]{2,4}|[۰-۹]{4}[/\.-][۰-۹]{1,2}[/\.-][۰-۹]{1,2}")
+TIME_RE     = re.compile(r"(?:ساعت\s*)?(\d{1,2}:\d{2}|\d{1,2}\s*(?:am|pm|AM|PM))\b", re.I)
+
 def _ws(t: str) -> str:
     return re.sub(r"\s+", " ", t.strip())
 
@@ -62,19 +59,10 @@ def _clean(t: str) -> str:
     t = t.replace("٫", ":").replace("ː", ":").replace("،", ",")
     return _ws(t)
 
-# ------------------- Patterns -------------------
-STATUS_FULL_PATTERNS = ("ظرفیت: تکمیل", "ظرفیت تکمیل", "تکمیل ظرفیت", "full", "closed", "sold out", "no seats")
-STATUS_OPEN_PATTERNS = ("ظرفیت: موجود", "ظرفیت موجود", "available", "open", "ثبت نام", "ثبت‌نام", "رزرو", "reserve", "book")
-STATUS_CANCELED_PATTERNS = ("لغو", "cancelled", "canceled")
-
-DATE_RE_ASC = re.compile(r"\b(?:\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}[/.-]\d{1,2}[/.-]\d{1,2})\b")
-DATE_RE_FA  = re.compile(r"[۰-۹]{1,2}[/\.-][۰-۹]{1,2}[/\.-][۰-۹]{2,4}|[۰-۹]{4}[/\.-][۰-۹]{1,2}[/\.-][۰-۹]{1,2}")
-TIME_RE     = re.compile(r"(?:ساعت\s*)?(\d{1,2}:\d{2}|\d{1,2}\s*(?:am|pm|AM|PM))\b", re.I)
-
 def _status(win: str) -> str:
     w = _clean(win).lower()
-    full_hit   = any(p.lower() in w for p in STATUS_FULL_PATTERNS)
-    open_hit   = any(p.lower() in w for p in STATUS_OPEN_PATTERNS)
+    full_hit = any(p.lower() in w for p in STATUS_FULL_PATTERNS)
+    open_hit = any(p.lower() in w for p in STATUS_OPEN_PATTERNS)
     cancel_hit = any(p.lower() in w for p in STATUS_CANCELED_PATTERNS)
     if full_hit and open_hit:
         return "full"
@@ -96,26 +84,25 @@ def _kind(block: str) -> str:
         return "IELTS"
     return "-"
 
-# ------------------- Fetch -------------------
+async def ensure_http() -> aiohttp.ClientSession:
+    global _http
+    if _http is None or _http.closed:
+        _http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20, connect=8))
+    return _http
+
 async def _fetch(url: str) -> str:
     s = await ensure_http()
     bust = ("&" if "?" in url else "?") + f"t={int(datetime.now().timestamp())}"
-    hdrs = {
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "User-Agent": "ielts-availability-bot/1.3",
-        "Accept-Language": "fa,en;q=0.8",
-    }
+    hdrs = {"Cache-Control": "no-cache", "Pragma": "no-cache", "User-Agent": "ielts-availability-bot/1.4", "Accept-Language": "fa,en;q=0.8"}
     for _ in range(3):
         try:
             async with s.get(url + bust, headers=hdrs) as r:
                 if r.status == 200:
                     return await r.text()
         except Exception:
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(0.4)
     return ""
 
-# ------------------- Parse -------------------
 def _entries_from_text(text: str, source: str) -> Dict[str, dict]:
     dates: List[tuple] = []
     for m in DATE_RE_ASC.finditer(text):
@@ -149,8 +136,7 @@ def parse_ieltstehran(html: str) -> Dict[str, dict]:
     soup = BeautifulSoup(html, "lxml")
     text = _clean(soup.get_text(separator=" "))
     ent: Dict[str, dict] = {}
-
-    for m in re.finditer(r"ظرفیت\s*[:：]?\s*([^\s،,]+)", text):
+    for m in re.finditer(r"ظرفیت\s*[:：]\s*([^\s،,]+)", text):
         cap = m.group(1)
         start = max(0, m.start() - 140)
         end   = min(len(text), m.end() + 140)
@@ -158,7 +144,6 @@ def parse_ieltstehran(html: str) -> Dict[str, dict]:
         kd  = _kind(win) or "CDIELTS"
         tm  = TIME_RE.search(win)
         tstr = tm.group(1) if tm else "-"
-
         date_val = "-"
         best = None
         for dm in DATE_RE_ASC.finditer(win):
@@ -172,20 +157,15 @@ def parse_ieltstehran(html: str) -> Dict[str, dict]:
                     best = (dist, _fa2en(dm.group()))
         if best is not None:
             date_val = best[1]
-
         cap_l = cap.lower()
         if ("تکمیل" in cap_l) or ("full" in cap_l):
             st = "full"
         elif ("موجود" in cap_l) or ("available" in cap_l) or ("open" in cap_l):
             st = "open"
         else:
-            st = _status(win)
-            if st == "open" and any(tok in win for tok in ("ظرفیت: تکمیل", "ظرفیت تکمیل", "تکمیل ظرفیت", "full", "closed")):
-                st = "full"
-
+            st = "unknown"
         key = " | ".join(x for x in ["IELTS Tehran", date_val, tstr, kd] if x)
         ent[key] = {"status": st, "source": "IELTS Tehran", "date": date_val, "time": tstr, "kind": kd, "context": win[:300]}
-
     if ent:
         return ent
     return _entries_from_text(text, "IELTS Tehran")
@@ -194,10 +174,8 @@ async def scrape_both() -> Dict[str, dict]:
     h1, h2 = await asyncio.gather(_fetch(URL_IRSAFAM), _fetch(URL_TEHRAN))
     e1 = parse_irsafam(h1 or "")
     e2 = parse_ieltstehran(h2 or "")
-    merged = {**e1, **e2}
-    return merged
+    return {**e1, **e2}
 
-# ------------------- State & Diff -------------------
 def load_state() -> dict:
     if os.path.exists(STATE_FILE):
         try:
@@ -227,7 +205,6 @@ def diff(prev: dict, curr: dict) -> List[dict]:
             out.append({"key": k, "type": "changed", "from": pv["status"], "to": cv["status"], "entry": cv})
     return out
 
-# ------------------- Embeds + UI -------------------
 def _field_text(lines: List[str]) -> str:
     if not lines:
         return "—"
@@ -278,12 +255,8 @@ def embed_panel(entries: Dict[str, dict]) -> discord.Embed:
     e.add_field(name="Open", value=f"🟢 **{total_open}**", inline=True)
     e.add_field(name="Full", value=f"🔴 **{total_full}**", inline=True)
     e.add_field(name="Slash Commands", value="`/ielts timetable` • `/ielts panel` • `/ielts refresh`", inline=False)
-    e.add_field(name="Auto Announcements", value="Tags **@everyone** when seats open.", inline=False)
+    e.add_field(name="Auto Announcements", value="Tags @everyone when seats open.", inline=False)
     return e
-
-# ------------------- Polling -------------------
-_last_snapshot: Dict[str, dict] = {}
-_poll_lock = asyncio.Lock()
 
 @tasks.loop(seconds=POLL_INTERVAL_SECONDS)
 async def poll():
@@ -310,64 +283,42 @@ async def poll():
         global _last_snapshot
         _last_snapshot = current
 
-# ------------------- Commands -------------------
 ielts = app_commands.Group(name="ielts", description="IELTS availability tools")
 
-@ielts.command(name="timetable", description="Show times and availability (Irsafam + IELTS Tehran)")
+@ielts.command(name="timetable", description="Show times and availability")
 async def cmd_timetable(interaction: discord.Interaction):
-    try:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-    except Exception:
-        return
+    data = _last_snapshot or load_state().get("entries", {})
+    msg_embed = embed_timetable(data)
+    await interaction.response.send_message(embed=msg_embed, ephemeral=True, view=SourceLinks())
     try:
         async with _poll_lock:
-            data = await scrape_both()
+            fresh = await asyncio.wait_for(scrape_both(), timeout=8)
             global _last_snapshot
-            _last_snapshot = data
-        await interaction.followup.send(embed=embed_timetable(data), ephemeral=True, view=SourceLinks())
+            _last_snapshot = fresh
+        await interaction.edit_original_response(embed=embed_timetable(fresh), view=SourceLinks())
     except Exception:
-        try:
-            await interaction.followup.send("Failed to fetch timetables.", ephemeral=True)
-        except Exception:
-            pass
+        pass
 
 @ielts.command(name="panel", description="Dashboard and quick links")
 async def cmd_panel(interaction: discord.Interaction):
-    try:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-    except Exception:
-        return
-    try:
-        data = _last_snapshot or load_state().get("entries", {})
-        await interaction.followup.send(embed=embed_panel(data), ephemeral=True, view=SourceLinks())
-    except Exception:
-        try:
-            await interaction.followup.send("Failed.", ephemeral=True)
-        except Exception:
-            pass
+    data = _last_snapshot or load_state().get("entries", {})
+    await interaction.response.send_message(embed=embed_panel(data), ephemeral=True, view=SourceLinks())
 
 @ielts.command(name="refresh", description="Force an immediate scrape")
 async def cmd_refresh(interaction: discord.Interaction):
-    try:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-    except Exception:
-        return
+    await interaction.response.send_message("Refreshing…", ephemeral=True)
     try:
         async with _poll_lock:
             data = await scrape_both()
             save_state({"entries": data})
             global _last_snapshot
             _last_snapshot = data
-        await interaction.followup.send("Refreshed.", ephemeral=True)
+        await interaction.edit_original_response(content="Refreshed.")
     except Exception:
-        try:
-            await interaction.followup.send("Refresh failed.", ephemeral=True)
-        except Exception:
-            pass
+        await interaction.edit_original_response(content="Refresh failed.")
 
 tree.add_command(ielts)
 
-# ------------------- Lifecycle -------------------
 @bot.event
 async def on_ready():
     await ensure_http()
@@ -381,7 +332,6 @@ async def on_ready():
     except Exception:
         pass
 
-# ------------------- Run -------------------
 async def _run_http():
     port = int(os.environ.get("PORT", "8000"))
     cfg = uvicorn.Config(api, host="0.0.0.0", port=port, log_level="info")
