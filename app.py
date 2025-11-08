@@ -40,13 +40,14 @@ _http: Optional[aiohttp.ClientSession] = None
 _last_snapshot: Dict[str, dict] = {}
 _poll_lock = asyncio.Lock()
 
-STATUS_FULL_PATTERNS = ("ظرفیت: تکمیل", "ظرفیت تکمیل", "تکمیل ظرفیت", "full", "closed", "sold out", "no seats")
-STATUS_OPEN_PATTERNS = ("ظرفیت: موجود", "ظرفیت موجود", "available", "open", "ثبت نام", "ثبت‌نام", "رزرو", "reserve", "book")
-STATUS_CANCELED_PATTERNS = ("لغو", "cancelled", "canceled")
+STATUS_FULL_TOKENS = ("ظرفیت: تکمیل", "ظرفیت تکمیل", "تکمیل ظرفیت", "full", "closed", "sold out", "no seats")
+STATUS_OPEN_TOKENS = ("ظرفیت: موجود", "ظرفیت موجود", "available", "open")
+STATUS_CANCEL_TOKENS = ("لغو", "cancelled", "canceled")
 
 DATE_RE_ASC = re.compile(r"\b(?:\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}[/.-]\d{1,2}[/.-]\d{1,2})\b")
 DATE_RE_FA  = re.compile(r"[۰-۹]{1,2}[/\.-][۰-۹]{1,2}[/\.-][۰-۹]{2,4}|[۰-۹]{4}[/\.-][۰-۹]{1,2}[/\.-][۰-۹]{1,2}")
 TIME_RE     = re.compile(r"(?:ساعت\s*)?(\d{1,2}:\d{2}|\d{1,2}\s*(?:am|pm|AM|PM))\b", re.I)
+CAP_RE      = re.compile(r"ظرفیت\s*[:：]\s*([^\s،,]+)")
 
 def _ws(t: str) -> str:
     return re.sub(r"\s+", " ", t.strip())
@@ -59,18 +60,13 @@ def _clean(t: str) -> str:
     t = t.replace("٫", ":").replace("ː", ":").replace("،", ",")
     return _ws(t)
 
-def _status(win: str) -> str:
+def _status_generic(win: str) -> str:
     w = _clean(win).lower()
-    full_hit = any(p.lower() in w for p in STATUS_FULL_PATTERNS)
-    open_hit = any(p.lower() in w for p in STATUS_OPEN_PATTERNS)
-    cancel_hit = any(p.lower() in w for p in STATUS_CANCELED_PATTERNS)
-    if full_hit and open_hit:
+    if any(tok.lower() in w for tok in STATUS_FULL_TOKENS):
         return "full"
-    if full_hit:
-        return "full"
-    if cancel_hit:
+    if any(tok.lower() in w for tok in STATUS_CANCEL_TOKENS):
         return "canceled"
-    if open_hit and not full_hit:
+    if any(tok.lower() in w for tok in STATUS_OPEN_TOKENS):
         return "open"
     return "unknown"
 
@@ -93,14 +89,14 @@ async def ensure_http() -> aiohttp.ClientSession:
 async def _fetch(url: str) -> str:
     s = await ensure_http()
     bust = ("&" if "?" in url else "?") + f"t={int(datetime.now().timestamp())}"
-    hdrs = {"Cache-Control": "no-cache", "Pragma": "no-cache", "User-Agent": "ielts-availability-bot/1.4", "Accept-Language": "fa,en;q=0.8"}
+    hdrs = {"Cache-Control": "no-cache", "Pragma": "no-cache", "User-Agent": "ielts-availability-bot/1.5", "Accept-Language": "fa,en;q=0.8"}
     for _ in range(3):
         try:
             async with s.get(url + bust, headers=hdrs) as r:
                 if r.status == 200:
                     return await r.text()
         except Exception:
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.3)
     return ""
 
 def _entries_from_text(text: str, source: str) -> Dict[str, dict]:
@@ -112,10 +108,10 @@ def _entries_from_text(text: str, source: str) -> Dict[str, dict]:
     ent: Dict[str, dict] = {}
     if dates:
         for d, s, e in dates:
-            start = max(0, s - 160)
-            end   = min(len(text), e + 160)
+            start = max(0, s - 140)
+            end   = min(len(text), e + 140)
             win = text[start:end]
-            st  = _status(win)
+            st  = _status_generic(win)
             kd  = _kind(win)
             tm  = TIME_RE.search(win)
             tstr = tm.group(1) if tm else "-"
@@ -124,7 +120,7 @@ def _entries_from_text(text: str, source: str) -> Dict[str, dict]:
     else:
         h = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
         key = f"{source} | {h}"
-        ent[key] = {"status": _status(text), "source": source, "date": "-", "time": "-", "kind": "-", "context": text[:300]}
+        ent[key] = {"status": _status_generic(text), "source": source, "date": "-", "time": "-", "kind": "-", "context": text[:300]}
     return ent
 
 def parse_irsafam(html: str) -> Dict[str, dict]:
@@ -136,7 +132,7 @@ def parse_ieltstehran(html: str) -> Dict[str, dict]:
     soup = BeautifulSoup(html, "lxml")
     text = _clean(soup.get_text(separator=" "))
     ent: Dict[str, dict] = {}
-    for m in re.finditer(r"ظرفیت\s*[:：]\s*([^\s،,]+)", text):
+    for m in CAP_RE.finditer(text):
         cap = m.group(1)
         start = max(0, m.start() - 140)
         end   = min(len(text), m.end() + 140)
@@ -158,13 +154,12 @@ def parse_ieltstehran(html: str) -> Dict[str, dict]:
         if best is not None:
             date_val = best[1]
         cap_l = cap.lower()
-        if ("تکمیل" in cap_l) or ("full" in cap_l):
+        if "تکمیل" in cap_l or "full" in cap_l or "closed" in cap_l:
             st = "full"
-        elif any(tok in cap_l for tok in ("موجود", "باز", "خالی")):
+        elif "موجود" in cap_l or "open" in cap_l or "available" in cap_l or "خالی" in cap_l or "باز" in cap_l:
             st = "open"
         else:
             st = "unknown"
-
         key = " | ".join(x for x in ["IELTS Tehran", date_val, tstr, kd] if x)
         ent[key] = {"status": st, "source": "IELTS Tehran", "date": date_val, "time": tstr, "kind": kd, "context": win[:300]}
     if ent:
@@ -286,38 +281,47 @@ async def poll():
 
 ielts = app_commands.Group(name="ielts", description="IELTS availability tools")
 
-@ielts.command(name="timetable", description="Show times and availability")
-async def cmd_timetable(interaction: discord.Interaction):
+async def _refresh_and_edit(interaction: discord.Interaction):
     global _last_snapshot
-    data = _last_snapshot or load_state().get("entries", {})
-    msg_embed = embed_timetable(data)
-    await interaction.response.send_message(embed=msg_embed, ephemeral=True, view=SourceLinks())
     try:
         async with _poll_lock:
             fresh = await asyncio.wait_for(scrape_both(), timeout=8)
             _last_snapshot = fresh
-        await interaction.edit_original_response(embed=embed_timetable(fresh), view=SourceLinks())
+        try:
+            await interaction.edit_original_response(embed=embed_timetable(fresh), view=SourceLinks())
+        except Exception:
+            pass
     except Exception:
         pass
 
+@ielts.command(name="timetable", description="Show times and availability")
+async def cmd_timetable(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    data = _last_snapshot or load_state().get("entries", {})
+    try:
+        await interaction.edit_original_response(embed=embed_timetable(data), view=SourceLinks())
+    except Exception:
+        return
+    asyncio.create_task(_refresh_and_edit(interaction))
+
 @ielts.command(name="panel", description="Dashboard and quick links")
 async def cmd_panel(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
     data = _last_snapshot or load_state().get("entries", {})
-    await interaction.response.send_message(embed=embed_panel(data), ephemeral=True, view=SourceLinks())
+    await interaction.edit_original_response(embed=embed_panel(data), view=SourceLinks())
 
 @ielts.command(name="refresh", description="Force an immediate scrape")
 async def cmd_refresh(interaction: discord.Interaction):
     global _last_snapshot
-    await interaction.response.send_message("Refreshing…", ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         async with _poll_lock:
-            data = await scrape_both()
+            data = await asyncio.wait_for(scrape_both(), timeout=10)
             save_state({"entries": data})
             _last_snapshot = data
         await interaction.edit_original_response(content="Refreshed.")
     except Exception:
         await interaction.edit_original_response(content="Refresh failed.")
-
 
 tree.add_command(ielts)
 
