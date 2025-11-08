@@ -43,16 +43,23 @@ tree = bot.tree
 
 _http: Optional[aiohttp.ClientSession] = None
 _last_snapshot: Dict[str, dict] = {}
+_panel_message_id: Optional[int] = None
 _poll_lock = asyncio.Lock()
 
-STATUS_FULL_TOKENS = ("ظرفیت: تکمیل", "ظرفیت تکمیل", "تکمیل ظرفیت", "full", "closed", "sold out", "no seats")
-STATUS_OPEN_TOKENS = ("ظرفیت: موجود", "ظرفیت موجود", "available", "open")
+STATUS_FULL_TOKENS = (
+    "ظرفیت: تکمیل", "ظرفیت تکمیل", "تکمیل ظرفیت", "تکمیل", "پر", "ناموجود",
+    "full", "closed", "sold out", "no seats", "not available"
+)
+STATUS_OPEN_TOKENS = (
+    "ظرفیت: موجود", "ظرفیت موجود", "خالی", "باز", "در دسترس", "قابل رزرو",
+    "ثبت نام", "رزرو", "available", "open", "book now", "register"
+)
 STATUS_CANCEL_TOKENS = ("لغو", "cancelled", "canceled")
 
 DATE_RE_ASC = re.compile(r"\b(?:\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}[/.-]\d{1,2}[/.-]\d{1,2})\b")
 DATE_RE_FA  = re.compile(r"[۰-۹]{1,2}[/\.-][۰-۹]{1,2}[/\.-][۰-۹]{2,4}|[۰-۹]{4}[/\.-][۰-۹]{1,2}[/\.-][۰-۹]{1,2}")
 TIME_RE     = re.compile(r"(?:ساعت\s*)?(\d{1,2}:\d{2}|\d{1,2}\s*(?:am|pm|AM|PM))\b", re.I)
-CAP_RE      = re.compile(r"ظرفیت\s*[:：]\s*([^\s،,]+)")
+CAP_RE      = re.compile(r"(?:ظرفیت|ظرفيت)\s*[:：]\s*([^\s،,]+)")
 
 def _ws(t: str) -> str:
     return re.sub(r"\s+", " ", t.strip())
@@ -62,6 +69,7 @@ def _fa2en(s: str) -> str:
 
 def _clean(t: str) -> str:
     t = _fa2en(t)
+    t = t.replace("\u200c", " ").replace("\u200f", " ").replace("\u202a", " ").replace("\u202b", " ")
     t = t.replace("٫", ":").replace("ː", ":").replace("،", ",")
     return _ws(t)
 
@@ -88,33 +96,40 @@ def _kind(block: str) -> str:
 async def ensure_http() -> aiohttp.ClientSession:
     global _http
     if _http is None or _http.closed:
-        connector = aiohttp.TCPConnector(limit=8, ttl_dns_cache=300, ssl=False, keepalive_timeout=30)
-        timeout = aiohttp.ClientTimeout(total=30, connect=12, sock_read=22, sock_connect=12)
+        connector = aiohttp.TCPConnector(limit=6, ttl_dns_cache=600, ssl=False, keepalive_timeout=45)
+        timeout = aiohttp.ClientTimeout(total=40, connect=15, sock_read=25, sock_connect=15)
         _http = aiohttp.ClientSession(connector=connector, timeout=timeout, trust_env=True)
     return _http
 
 async def _fetch(url: str) -> str:
     s = await ensure_http()
     bust = ("&" if "?" in url else "?") + f"t={int(datetime.now().timestamp())}"
+    origin = url.split("/", 3)
+    referer = f"{origin[0]}//{origin[2]}/" if len(origin) >= 3 else url
     hdrs = {
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
-        "User-Agent": "ielts-availability-bot/1.9",
+        "User-Agent": "Mozilla/5.0 (compatible; IELTSBot/1.10; +https://example.invalid)",
         "Accept-Language": "fa,en;q=0.8",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": referer,
+        "DNT": "1",
     }
     delay = 0.8
     for _ in range(6):
         try:
             async with s.get(url + bust, headers=hdrs, allow_redirects=True) as r:
                 if r.status == 200:
-                    return await r.text()
+                    text = await r.text(errors="ignore")
+                    if text:
+                        return text
         except Exception:
             await asyncio.sleep(delay)
-            delay = min(3.0, delay * 1.4)
+            delay = min(4.0, delay * 1.4)
     return ""
 
 def _entries_from_text(text: str, source: str) -> Dict[str, dict]:
+    text = _clean(text)
     dates: List[tuple] = []
     for m in DATE_RE_ASC.finditer(text):
         dates.append((m.group(), m.start(), m.end()))
@@ -123,25 +138,26 @@ def _entries_from_text(text: str, source: str) -> Dict[str, dict]:
     ent: Dict[str, dict] = {}
     if dates:
         for d, s, e in dates:
-            start = max(0, s - 140)
-            end = min(len(text), e + 140)
+            start = max(0, s - 160)
+            end   = min(len(text), e + 160)
             win = text[start:end]
-            st = _status_generic(win)
-            kd = _kind(win)
-            tm = TIME_RE.search(win)
+            st  = _status_generic(win)
+            kd  = _kind(win)
+            tm  = TIME_RE.search(win)
             tstr = tm.group(1) if tm else "-"
             key = " | ".join(x for x in [source, d, tstr, kd] if x)
             ent[key] = {"status": st, "source": source, "date": d, "time": tstr, "kind": kd, "context": win[:300]}
     else:
-        if text.strip():
-            h = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+        core = " ".join(text.split()[:40])
+        if core:
+            h = hashlib.sha256(core.encode("utf-8")).hexdigest()[:16]
             key = f"{source} | {h}"
-            ent[key] = {"status": _status_generic(text), "source": source, "date": "-", "time": "-", "kind": "-", "context": text[:300]}
+            ent[key] = {"status": _status_generic(text), "source": source, "date": "-", "time": "-", "kind": "-", "context": core[:300]}
     return ent
 
 def parse_irsafam(html: str) -> Dict[str, dict]:
     soup = BeautifulSoup(html, "lxml")
-    text = _clean(soup.get_text(separator=" "))
+    text = soup.get_text(separator=" ")
     return _entries_from_text(text, "Irsafam")
 
 def parse_ieltstehran(html: str) -> Dict[str, dict]:
@@ -150,11 +166,11 @@ def parse_ieltstehran(html: str) -> Dict[str, dict]:
     ent: Dict[str, dict] = {}
     for m in CAP_RE.finditer(text):
         cap = m.group(1)
-        start = max(0, m.start() - 140)
-        end = min(len(text), m.end() + 140)
+        start = max(0, m.start() - 160)
+        end   = min(len(text), m.end() + 160)
         win = text[start:end]
-        kd = _kind(win) or "CDIELTS"
-        tm = TIME_RE.search(win)
+        kd  = _kind(win) or "CDIELTS"
+        tm  = TIME_RE.search(win)
         tstr = tm.group(1) if tm else "-"
         date_val = "-"
         best = None
@@ -170,9 +186,9 @@ def parse_ieltstehran(html: str) -> Dict[str, dict]:
         if best is not None:
             date_val = best[1]
         cap_l = cap.lower()
-        if "تکمیل" in cap_l or "full" in cap_l or "closed" in cap_l:
+        if "تکمیل" in cap_l or "full" in cap_l or "closed" in cap_l or "ناموجود" in cap_l or "پر" in cap_l:
             st = "full"
-        elif "موجود" in cap_l or "open" in cap_l or "available" in cap_l or "خالی" in cap_l or "باز" in cap_l:
+        elif "موجود" in cap_l or "open" in cap_l or "available" in cap_l or "خالی" in cap_l or "باز" in cap_l or "ثبت نام" in win or "رزرو" in win:
             st = "open"
         else:
             st = "unknown"
@@ -194,8 +210,8 @@ def load_state() -> dict:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
-            return {"entries": {}}
-    return {"entries": {}}
+            return {"entries": {}, "panel_message_id": None}
+    return {"entries": {}, "panel_message_id": None}
 
 def save_state(obj: dict) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -209,11 +225,11 @@ def diff(prev: dict, curr: dict) -> List[dict]:
     for k in keys:
         pv = p.get(k)
         cv = c.get(k)
-        if pv is None:
+        if pv is None and cv is not None:
             out.append({"key": k, "type": "added", "from": None, "to": cv["status"], "entry": cv})
-        elif cv is None:
+        elif cv is None and pv is not None:
             out.append({"key": k, "type": "removed", "from": pv["status"], "to": None, "entry": pv})
-        elif pv["status"] != cv["status"]:
+        elif pv and cv and pv.get("status") != cv.get("status"):
             out.append({"key": k, "type": "changed", "from": pv["status"], "to": cv["status"], "entry": cv})
     return out
 
@@ -232,20 +248,26 @@ class SourceLinks(discord.ui.View):
 def embed_timetable(entries: Dict[str, dict]) -> discord.Embed:
     now = datetime.now(timezone.utc)
     e = discord.Embed(title="IELTS — Times & Availability", timestamp=now, color=0x2B2D31)
-    groups = {"Irsafam": {"open": [], "full": []}, "IELTS Tehran": {"open": [], "full": []}}
+    groups = {
+        "Irsafam": {"open": [], "full": [], "unknown": []},
+        "IELTS Tehran": {"open": [], "full": [], "unknown": []},
+    }
     for v in entries.values():
         src = v.get("source", "Irsafam")
-        st = v.get("status", "unknown")
+        st  = v.get("status", "unknown")
         row = f"{v.get('date','-')} • {v.get('time','-')} • {v.get('kind','-')}"
         if st == "open":
-            groups.setdefault(src, {"open": [], "full": []})["open"].append(f"🟢 {row}")
+            groups.setdefault(src, {"open": [], "full": [], "unknown": []})["open"].append(f"🟢 {row}")
         elif st == "full":
-            groups.setdefault(src, {"open": [], "full": []})["full"].append(f"🔴 {row}")
+            groups.setdefault(src, {"open": [], "full": [], "unknown": []})["full"].append(f"🔴 {row}")
+        else:
+            groups.setdefault(src, {"open": [], "full": [], "unknown": []})["unknown"].append(f"⚪ {row}")
     for src in ("Irsafam", "IELTS Tehran"):
         e.add_field(name=f"{src} — Open", value=_field_text(groups[src]["open"][:20]), inline=False)
         e.add_field(name=f"{src} — Full", value=_field_text(groups[src]["full"][:20]), inline=False)
+        e.add_field(name=f"{src} — Unknown", value=_field_text(groups[src]["unknown"][:10]), inline=False)
     e.add_field(name="Sources", value=f"[Irsafam]({URL_IRSAFAM}) • [IELTS Tehran]({URL_TEHRAN})", inline=False)
-    e.set_footer(text="Ephemeral snapshot")
+    e.set_footer(text="Auto-refresh snapshot")
     return e
 
 def embed_alert(open_changes: List[dict]) -> discord.Embed:
@@ -263,19 +285,56 @@ def embed_panel(entries: Dict[str, dict]) -> discord.Embed:
     now = datetime.now(timezone.utc)
     total_open = sum(1 for v in entries.values() if v.get("status") == "open")
     total_full = sum(1 for v in entries.values() if v.get("status") == "full")
+    total_unknown = sum(1 for v in entries.values() if v.get("status") == "unknown")
     e = discord.Embed(title="IELTS Bot — Panel", timestamp=now, color=0x5865F2)
     e.add_field(name="Open", value=f"🟢 **{total_open}**", inline=True)
     e.add_field(name="Full", value=f"🔴 **{total_full}**", inline=True)
-    e.add_field(name="Slash Commands", value="`/timetable` • `/panel` • `/refresh`", inline=False)
+    e.add_field(name="Unknown", value=f"⚪ **{total_unknown}**", inline=True)
+    e.add_field(name="Slash Commands", value="`/timetable` • `/panel`", inline=False)
     e.add_field(name="Auto Announcements", value="Tags @everyone when seats open.", inline=False)
     return e
 
-async def _ack(interaction: discord.Interaction) -> None:
-    if not interaction.response.is_done():
+def _load_ids_from_state() -> None:
+    global _panel_message_id
+    st = load_state()
+    _panel_message_id = st.get("panel_message_id")
+
+async def _save_ids_to_state() -> None:
+    st = load_state()
+    st["panel_message_id"] = _panel_message_id
+    st["entries"] = _last_snapshot
+    save_state(st)
+
+async def _ensure_panel_message() -> Optional[discord.Message]:
+    ch = bot.get_channel(CHANNEL_ID)
+    if ch is None:
         try:
-            await interaction.response.defer(thinking=True)
+            ch = await bot.fetch_channel(CHANNEL_ID)
         except Exception:
-            pass
+            return None
+    global _panel_message_id
+    if _panel_message_id:
+        try:
+            msg = await ch.fetch_message(_panel_message_id)
+            return msg
+        except Exception:
+            _panel_message_id = None
+    try:
+        msg = await ch.send(embed=embed_timetable(_last_snapshot or {}), view=SourceLinks())
+        _panel_message_id = msg.id
+        await _save_ids_to_state()
+        return msg
+    except Exception:
+        return None
+
+async def _update_panel_message() -> None:
+    msg = await _ensure_panel_message()
+    if msg is None:
+        return
+    try:
+        await msg.edit(embed=embed_timetable(_last_snapshot or {}), view=SourceLinks())
+    except Exception:
+        pass
 
 @tasks.loop(seconds=POLL_INTERVAL_SECONDS)
 async def poll():
@@ -288,7 +347,7 @@ async def poll():
         prev = state.get("entries", {})
         changes = diff({"entries": prev}, {"entries": current})
         if changes:
-            save_state({"entries": current})
+            save_state({"entries": current, "panel_message_id": state.get("panel_message_id")})
             open_changes = [c for c in changes if c["to"] == "open"]
             if open_changes:
                 ch = bot.get_channel(CHANNEL_ID)
@@ -298,60 +357,32 @@ async def poll():
                     except Exception:
                         ch = None
                 if ch:
-                    await ch.send(content="@everyone", embed=embed_alert(open_changes), allowed_mentions=discord.AllowedMentions(everyone=True), view=SourceLinks())
+                    try:
+                        await ch.send(
+                            content="@everyone",
+                            embed=embed_alert(open_changes),
+                            allowed_mentions=discord.AllowedMentions(everyone=True),
+                            view=SourceLinks(),
+                        )
+                    except Exception:
+                        pass
         global _last_snapshot
         _last_snapshot = current
+        await _update_panel_message()
 
-async def _refresh_and_edit(interaction: discord.Interaction):
-    global _last_snapshot
+async def handle_timetable(interaction: discord.Interaction):
+    data = _last_snapshot or load_state().get("entries", {})
     try:
-        async with _poll_lock:
-            fresh = await scrape_both()
-            if fresh:
-                _last_snapshot = fresh
-        if _last_snapshot:
-            try:
-                await interaction.edit_original_response(embed=embed_timetable(_last_snapshot), view=SourceLinks())
-            except Exception:
-                await interaction.followup.send(embed=embed_timetable(_last_snapshot), view=SourceLinks())
+        await interaction.response.send_message(embed=embed_timetable(data), view=SourceLinks(), ephemeral=True)
     except Exception:
         pass
 
-async def handle_timetable(interaction: discord.Interaction):
-    await _ack(interaction)
-    data = _last_snapshot or load_state().get("entries", {})
-    try:
-        await interaction.edit_original_response(embed=embed_timetable(data), view=SourceLinks())
-    except Exception:
-        await interaction.followup.send(embed=embed_timetable(data), view=SourceLinks())
-    asyncio.create_task(_refresh_and_edit(interaction))
-
 async def handle_panel(interaction: discord.Interaction):
-    await _ack(interaction)
     data = _last_snapshot or load_state().get("entries", {})
     try:
-        await interaction.edit_original_response(embed=embed_panel(data), view=SourceLinks())
+        await interaction.response.send_message(embed=embed_panel(data), view=SourceLinks(), ephemeral=True)
     except Exception:
-        await interaction.followup.send(embed=embed_panel(data), view=SourceLinks())
-
-async def handle_refresh(interaction: discord.Interaction):
-    await _ack(interaction)
-    try:
-        async with _poll_lock:
-            data = await scrape_both()
-            if data:
-                save_state({"entries": data})
-                global _last_snapshot
-                _last_snapshot = data
-        try:
-            await interaction.edit_original_response(content="Refreshed.")
-        except Exception:
-            await interaction.followup.send(content="Refreshed.")
-    except Exception:
-        try:
-            await interaction.edit_original_response(content="Refresh failed.")
-        except Exception:
-            await interaction.followup.send(content="Refresh failed.")
+        pass
 
 def register_commands():
     guild_obj = discord.Object(id=GUILD_ID) if GUILD_ID > 0 else None
@@ -362,30 +393,22 @@ def register_commands():
     async def _panel(interaction: discord.Interaction):
         await handle_panel(interaction)
 
-    async def _refresh(interaction: discord.Interaction):
-        await handle_refresh(interaction)
-
     if guild_obj:
         tree.command(name="timetable", description="Show times and availability", guild=guild_obj)(_timetable)
         tree.command(name="panel", description="Dashboard and quick links", guild=guild_obj)(_panel)
-        tree.command(name="refresh", description="Force an immediate scrape", guild=guild_obj)(_refresh)
     else:
         tree.command(name="timetable", description="Show times and availability")(_timetable)
         tree.command(name="panel", description="Dashboard and quick links")(_panel)
-        tree.command(name="refresh", description="Force an immediate scrape")(_refresh)
 
 register_commands()
 
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    try:
-        if not interaction.response.is_done():
-            await interaction.response.defer(thinking=False)
-    except Exception:
-        pass
+    pass
 
 @bot.event
 async def on_ready():
+    _load_ids_from_state()
     await ensure_http()
     if not poll.is_running():
         poll.start()
@@ -409,7 +432,8 @@ async def on_ready():
             if snap:
                 global _last_snapshot
                 _last_snapshot = snap
-                save_state({"entries": snap})
+        await _save_ids_to_state()
+        await _update_panel_message()
     except Exception:
         pass
 
