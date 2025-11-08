@@ -88,20 +88,30 @@ def _kind(block: str) -> str:
 async def ensure_http() -> aiohttp.ClientSession:
     global _http
     if _http is None or _http.closed:
-        _http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20, connect=8))
+        connector = aiohttp.TCPConnector(limit=8, ttl_dns_cache=300, ssl=False, keepalive_timeout=30)
+        timeout = aiohttp.ClientTimeout(total=30, connect=12, sock_read=22, sock_connect=12)
+        _http = aiohttp.ClientSession(connector=connector, timeout=timeout, trust_env=True)
     return _http
 
 async def _fetch(url: str) -> str:
     s = await ensure_http()
     bust = ("&" if "?" in url else "?") + f"t={int(datetime.now().timestamp())}"
-    hdrs = {"Cache-Control": "no-cache", "Pragma": "no-cache", "User-Agent": "ielts-availability-bot/1.7", "Accept-Language": "fa,en;q=0.8"}
-    for _ in range(3):
+    hdrs = {
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "User-Agent": "ielts-availability-bot/1.9",
+        "Accept-Language": "fa,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    delay = 0.8
+    for _ in range(6):
         try:
-            async with s.get(url + bust, headers=hdrs) as r:
+            async with s.get(url + bust, headers=hdrs, allow_redirects=True) as r:
                 if r.status == 200:
                     return await r.text()
         except Exception:
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(delay)
+            delay = min(3.0, delay * 1.4)
     return ""
 
 def _entries_from_text(text: str, source: str) -> Dict[str, dict]:
@@ -114,18 +124,19 @@ def _entries_from_text(text: str, source: str) -> Dict[str, dict]:
     if dates:
         for d, s, e in dates:
             start = max(0, s - 140)
-            end   = min(len(text), e + 140)
+            end = min(len(text), e + 140)
             win = text[start:end]
-            st  = _status_generic(win)
-            kd  = _kind(win)
-            tm  = TIME_RE.search(win)
+            st = _status_generic(win)
+            kd = _kind(win)
+            tm = TIME_RE.search(win)
             tstr = tm.group(1) if tm else "-"
             key = " | ".join(x for x in [source, d, tstr, kd] if x)
             ent[key] = {"status": st, "source": source, "date": d, "time": tstr, "kind": kd, "context": win[:300]}
     else:
-        h = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
-        key = f"{source} | {h}"
-        ent[key] = {"status": _status_generic(text), "source": source, "date": "-", "time": "-", "kind": "-", "context": text[:300]}
+        if text.strip():
+            h = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+            key = f"{source} | {h}"
+            ent[key] = {"status": _status_generic(text), "source": source, "date": "-", "time": "-", "kind": "-", "context": text[:300]}
     return ent
 
 def parse_irsafam(html: str) -> Dict[str, dict]:
@@ -140,10 +151,10 @@ def parse_ieltstehran(html: str) -> Dict[str, dict]:
     for m in CAP_RE.finditer(text):
         cap = m.group(1)
         start = max(0, m.start() - 140)
-        end   = min(len(text), m.end() + 140)
+        end = min(len(text), m.end() + 140)
         win = text[start:end]
-        kd  = _kind(win) or "CDIELTS"
-        tm  = TIME_RE.search(win)
+        kd = _kind(win) or "CDIELTS"
+        tm = TIME_RE.search(win)
         tstr = tm.group(1) if tm else "-"
         date_val = "-"
         best = None
@@ -224,7 +235,7 @@ def embed_timetable(entries: Dict[str, dict]) -> discord.Embed:
     groups = {"Irsafam": {"open": [], "full": []}, "IELTS Tehran": {"open": [], "full": []}}
     for v in entries.values():
         src = v.get("source", "Irsafam")
-        st  = v.get("status", "unknown")
+        st = v.get("status", "unknown")
         row = f"{v.get('date','-')} • {v.get('time','-')} • {v.get('kind','-')}"
         if st == "open":
             groups.setdefault(src, {"open": [], "full": []})["open"].append(f"🟢 {row}")
@@ -255,7 +266,7 @@ def embed_panel(entries: Dict[str, dict]) -> discord.Embed:
     e = discord.Embed(title="IELTS Bot — Panel", timestamp=now, color=0x5865F2)
     e.add_field(name="Open", value=f"🟢 **{total_open}**", inline=True)
     e.add_field(name="Full", value=f"🔴 **{total_full}**", inline=True)
-    e.add_field(name="Slash Commands", value="`/ielts timetable` • `/ielts panel` • `/ielts refresh`", inline=False)
+    e.add_field(name="Slash Commands", value="`/timetable` • `/panel` • `/refresh`", inline=False)
     e.add_field(name="Auto Announcements", value="Tags @everyone when seats open.", inline=False)
     return e
 
@@ -263,16 +274,15 @@ async def _ack(interaction: discord.Interaction) -> None:
     if not interaction.response.is_done():
         try:
             await interaction.response.defer(thinking=True)
-        except Exception as e:
-            logging.warning("Defer failed: %s", e)
+        except Exception:
+            pass
 
 @tasks.loop(seconds=POLL_INTERVAL_SECONDS)
 async def poll():
     async with _poll_lock:
         try:
             current = await scrape_both()
-        except Exception as e:
-            logging.warning("Scrape error: %s", e)
+        except Exception:
             return
         state = load_state()
         prev = state.get("entries", {})
@@ -285,32 +295,27 @@ async def poll():
                 if ch is None:
                     try:
                         ch = await bot.fetch_channel(CHANNEL_ID)
-                    except Exception as e:
-                        logging.warning("Channel fetch error: %s", e)
+                    except Exception:
                         ch = None
                 if ch:
                     await ch.send(content="@everyone", embed=embed_alert(open_changes), allowed_mentions=discord.AllowedMentions(everyone=True), view=SourceLinks())
         global _last_snapshot
         _last_snapshot = current
 
-ielts = app_commands.Group(name="ielts", description="IELTS availability tools")
-
 async def _refresh_and_edit(interaction: discord.Interaction):
     global _last_snapshot
     try:
         async with _poll_lock:
-            fresh = await asyncio.wait_for(scrape_both(), timeout=8)
-            _last_snapshot = fresh
-        try:
-            await interaction.edit_original_response(embed=embed_timetable(fresh), view=SourceLinks())
-        except Exception:
-            await interaction.followup.send(embed=embed_timetable(fresh), view=SourceLinks())
-    except Exception as e:
-        logging.exception("Refresh/edit error: %s", e)
-        try:
-            await interaction.followup.send(content="Error refreshing.")
-        except Exception:
-            pass
+            fresh = await scrape_both()
+            if fresh:
+                _last_snapshot = fresh
+        if _last_snapshot:
+            try:
+                await interaction.edit_original_response(embed=embed_timetable(_last_snapshot), view=SourceLinks())
+            except Exception:
+                await interaction.followup.send(embed=embed_timetable(_last_snapshot), view=SourceLinks())
+    except Exception:
+        pass
 
 async def handle_timetable(interaction: discord.Interaction):
     await _ack(interaction)
@@ -333,56 +338,49 @@ async def handle_refresh(interaction: discord.Interaction):
     await _ack(interaction)
     try:
         async with _poll_lock:
-            data = await asyncio.wait_for(scrape_both(), timeout=10)
-            save_state({"entries": data})
-            global _last_snapshot
-            _last_snapshot = data
+            data = await scrape_both()
+            if data:
+                save_state({"entries": data})
+                global _last_snapshot
+                _last_snapshot = data
         try:
             await interaction.edit_original_response(content="Refreshed.")
         except Exception:
             await interaction.followup.send(content="Refreshed.")
-    except Exception as e:
-        logging.exception("Refresh command failed: %s", e)
+    except Exception:
         try:
             await interaction.edit_original_response(content="Refresh failed.")
         except Exception:
             await interaction.followup.send(content="Refresh failed.")
 
-@ielts.command(name="timetable", description="Show times and availability")
-async def group_timetable(interaction: discord.Interaction):
-    await handle_timetable(interaction)
+def register_commands():
+    guild_obj = discord.Object(id=GUILD_ID) if GUILD_ID > 0 else None
 
-@ielts.command(name="panel", description="Dashboard and quick links")
-async def group_panel(interaction: discord.Interaction):
-    await handle_panel(interaction)
+    async def _timetable(interaction: discord.Interaction):
+        await handle_timetable(interaction)
 
-@ielts.command(name="refresh", description="Force an immediate scrape")
-async def group_refresh(interaction: discord.Interaction):
-    await handle_refresh(interaction)
+    async def _panel(interaction: discord.Interaction):
+        await handle_panel(interaction)
 
-@tree.command(name="timetable", description="Show times and availability")
-async def root_timetable(interaction: discord.Interaction):
-    await handle_timetable(interaction)
+    async def _refresh(interaction: discord.Interaction):
+        await handle_refresh(interaction)
 
-@tree.command(name="panel", description="Dashboard and quick links")
-async def root_panel(interaction: discord.Interaction):
-    await handle_panel(interaction)
+    if guild_obj:
+        tree.command(name="timetable", description="Show times and availability", guild=guild_obj)(_timetable)
+        tree.command(name="panel", description="Dashboard and quick links", guild=guild_obj)(_panel)
+        tree.command(name="refresh", description="Force an immediate scrape", guild=guild_obj)(_refresh)
+    else:
+        tree.command(name="timetable", description="Show times and availability")(_timetable)
+        tree.command(name="panel", description="Dashboard and quick links")(_panel)
+        tree.command(name="refresh", description="Force an immediate scrape")(_refresh)
 
-@tree.command(name="refresh", description="Force an immediate scrape")
-async def root_refresh(interaction: discord.Interaction):
-    await handle_refresh(interaction)
-
-tree.add_command(ielts)
+register_commands()
 
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    logging.exception("App command error", exc_info=error)
-    msg = f"{type(error).__name__}: {error}"
     try:
         if not interaction.response.is_done():
-            await interaction.response.send_message(msg, ephemeral=True)
-        else:
-            await interaction.followup.send(msg, ephemeral=True)
+            await interaction.response.defer(thinking=False)
     except Exception:
         pass
 
@@ -392,15 +390,28 @@ async def on_ready():
     if not poll.is_running():
         poll.start()
     try:
-        if GUILD_ID > 0:
-            await tree.sync(guild=discord.Object(id=GUILD_ID))
-        else:
-            for g in bot.guilds:
+        for g in bot.guilds:
+            try:
                 await tree.sync(guild=g)
-            await tree.sync()
-        logging.info("Synced commands. Guilds: %s", [g.id for g in bot.guilds])
-    except Exception as e:
-        logging.exception("Sync error: %s", e)
+            except Exception:
+                pass
+        await tree.sync()
+        if GUILD_ID > 0:
+            try:
+                await tree.sync(guild=discord.Object(id=GUILD_ID))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        async with _poll_lock:
+            snap = await scrape_both()
+            if snap:
+                global _last_snapshot
+                _last_snapshot = snap
+                save_state({"entries": snap})
+    except Exception:
+        pass
 
 async def _run_http():
     port = int(os.environ.get("PORT", "8000"))
