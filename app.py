@@ -6,9 +6,11 @@ import hashlib
 import aiohttp
 import discord
 from discord.ext import tasks
+from discord import app_commands
 from bs4 import BeautifulSoup
 from fastapi import FastAPI
 import uvicorn
+from datetime import datetime, timezone
 
 api = FastAPI()
 
@@ -21,9 +23,11 @@ TOKEN = os.environ["DISCORD_TOKEN"]
 CHANNEL_ID = int(os.environ["DISCORD_CHANNEL_ID"])
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 POLL_INTERVAL_MINUTES = int(os.getenv("POLL_INTERVAL_MINUTES", "5"))
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
 
 def normalize_text(t):
     return re.sub(r"\s+", " ", t.strip())
@@ -33,12 +37,12 @@ def fa_to_en_digits(s):
     return s.translate(trans)
 
 def status_from_text(t):
-    tn = normalize_text(t)
-    if "تکمیل ظرفیت" in tn or "ظرفیت تکمیل" in tn or "full" in tn or "closed" in tn:
+    tn = normalize_text(t).lower()
+    if ("تکمیل ظرفیت" in tn) or ("ظرفیت تکمیل" in tn) or ("full" in tn) or ("closed" in tn):
         return "full"
-    if "ثبت نام" in tn or "ثبت‌نام" in tn or "available" in tn or "open" in tn:
+    if ("ثبت نام" in tn) or ("ثبت‌نام" in tn) or ("available" in tn) or ("open" in tn):
         return "open"
-    if "لغو" in tn or "cancelled" in tn or "canceled" in tn:
+    if ("لغو" in tn) or ("cancelled" in tn) or ("canceled" in tn):
         return "canceled"
     return "unknown"
 
@@ -56,12 +60,20 @@ def parse_page(html):
     entries = {}
     if dates:
         for d, s, e in dates:
-            start = max(0, s - 220)
-            end = min(len(text), e + 220)
+            start = max(0, s - 260)
+            end = min(len(text), e + 260)
             window = text[start:end]
             status = status_from_text(window)
-            kind = "IELTS" if "IELTS" in window.upper() or "آیلتس" in window else ""
-            key = (kind + " " + d).strip()
+            kind = ""
+            if "UKVI" in window.upper():
+                kind = "UKVI"
+            elif "CDIELTS" in window.upper():
+                kind = "CDIELTS"
+            elif ("IELTS" in window.upper()) or ("آیلتس" in window):
+                kind = "IELTS"
+            time_match = re.search(r"\b\d{1,2}:\d{2}\b", window)
+            time_str = time_match.group(0) if time_match else ""
+            key = " ".join(x for x in [kind, d, time_str] if x).strip()
             if key not in entries or entries[key]["status"] == "unknown":
                 entries[key] = {"status": status, "context": window[:300]}
     else:
@@ -98,15 +110,41 @@ def diff(prev, curr):
             changes.append({"key": k, "type": "changed", "from": pv["status"], "to": cv["status"], "context": cv["context"]})
     return changes
 
-async def fetch_html():
-    timeout = aiohttp.ClientTimeout(total=30, connect=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(URL, timeout=30) as r:
+def build_embed(entries: dict) -> discord.Embed:
+    e = discord.Embed(title="AAA — IELTS Timetable", url=URL, timestamp=datetime.now(timezone.utc))
+    open_items = [(k, v) for k, v in entries.items() if v.get("status") == "open"]
+    full_items = [(k, v) for k, v in entries.items() if v.get("status") == "full"]
+    other_items = [(k, v) for k, v in entries.items() if v.get("status") not in ("open", "full")]
+    desc = []
+    if open_items:
+        desc.append("Open")
+        for k, _ in sorted(open_items)[:15]:
+            desc.append(f"• {k}")
+    if full_items:
+        if desc:
+            desc.append("")
+        desc.append("Full")
+        for k, _ in sorted(full_items)[:15]:
+            desc.append(f"• {k}")
+    if other_items:
+        if desc:
+            desc.append("")
+        desc.append("Other")
+        for k, v in sorted(other_items)[:10]:
+            desc.append(f"• {k}: {v.get('status','unknown')}")
+    e.description = "\n".join(desc) if desc else "No timetable entries found."
+    e.set_footer(text="Ephemeral snapshot")
+    return e
+
+async def fetch_html_fresh():
+    timeout = aiohttp.ClientTimeout(total=25, connect=10)
+    async with aiohttp.ClientSession(timeout=timeout, headers={"Cache-Control": "no-cache", "Pragma": "no-cache"}) as session:
+        async with session.get(URL) as r:
             return await r.text()
 
 @tasks.loop(minutes=POLL_INTERVAL_MINUTES)
 async def poll():
-    html = await fetch_html()
+    html = await fetch_html_fresh()
     current = parse_page(html)
     state = load_state(STATE_FILE)
     prev = state.get("entries", {})
@@ -133,10 +171,24 @@ async def poll():
             await ch.send(msg)
         save_state(STATE_FILE, {"entries": current})
 
+@tree.command(name="timetable", description="AAA — show current IELTS timetable and availability")
+async def timetable(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    html = await fetch_html_fresh()
+    entries = parse_page(html)
+    await interaction.followup.send(embed=build_embed(entries), ephemeral=True)
+
 @client.event
 async def on_ready():
     if not poll.is_running():
         poll.start()
+    try:
+        if GUILD_ID > 0:
+            await tree.sync(guild=discord.Object(id=GUILD_ID))
+        else:
+            await tree.sync()
+    except Exception:
+        pass
 
 async def _run_http():
     port = int(os.environ.get("PORT", "8000"))
