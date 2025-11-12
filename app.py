@@ -54,6 +54,7 @@ DATE_RE_FA  = re.compile(r"[۰-۹]{1,2}[/\.-][۰-۹]{1,2}[/\.-][۰-۹]{2,4}|[۰-
 TIME_RE     = re.compile(r"(?:ساعت\s*)?(\d{1,2}[:٫]\d{2}|\d{1,2}\s*(?:am|pm|AM|PM))\b", re.I)
 
 IRSAFAM_FULL = re.compile(r"\bتکمیل\s*ظرفیت\b")
+IRSAFAM_OPEN = re.compile(r"\bرزرو\b")
 TEHRAN_FULL  = re.compile(r"\bظرفیت\s*[:：]\s*تکمیل\b")
 
 def _ws(t: str) -> str:
@@ -134,7 +135,13 @@ def _collect_by_dates(text: str) -> List[tuple]:
     hits.sort(key=lambda x: x[1])
     return hits
 
-def _entries_from_page(text: str, source: str, full_marker: re.Pattern) -> Dict[str, dict]:
+def _entries_from_page(
+    text: str,
+    source: str,
+    full_marker: Optional[re.Pattern] = None,
+    open_marker: Optional[re.Pattern] = None,
+    default_status: str = "open",
+) -> Dict[str, dict]:
     t = _clean(text)
     entries: Dict[str, dict] = {}
     dates = _collect_by_dates(t)
@@ -143,14 +150,22 @@ def _entries_from_page(text: str, source: str, full_marker: re.Pattern) -> Dict[
         if snippet:
             h = hashlib.sha256(snippet.encode("utf-8")).hexdigest()[:16]
             key = f"{source} | {h}"
-            status = "full" if full_marker.search(t) else "open"
+            status = default_status
+            if full_marker and full_marker.search(t):
+                status = "full"
+            elif open_marker and open_marker.search(t):
+                status = "open"
             entries[key] = {"status": status, "source": source, "date": "-", "time": "-", "kind": "-", "context": snippet[:300]}
         return entries
     for d, s, e in dates:
         start = max(0, s - 220)
         end = min(len(t), e + 220)
         win = t[start:end]
-        status = "full" if full_marker.search(win) else "open"
+        status = default_status
+        if full_marker and full_marker.search(win):
+            status = "full"
+        elif open_marker and open_marker.search(win):
+            status = "open"
         kd = _kind(win)
         tm = _pick_time(win)
         key = " | ".join(x for x in [source, d, tm, kd] if x)
@@ -160,7 +175,7 @@ def _entries_from_page(text: str, source: str, full_marker: re.Pattern) -> Dict[
 def parse_irsafam(html: str) -> Dict[str, dict]:
     soup = BeautifulSoup(html, "lxml")
     text = soup.get_text(separator=" ")
-    return _entries_from_page(text, "Irsafam", IRSAFAM_FULL)
+    return _entries_from_page(text, "Irsafam", IRSAFAM_FULL, IRSAFAM_OPEN, "full")
 
 def parse_ieltstehran(html: str) -> Dict[str, dict]:
     soup = BeautifulSoup(html, "lxml")
